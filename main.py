@@ -22,6 +22,7 @@ PORTFOLIO_FILE = Path("/tmp/kitebird-portfolio.json")
 TEAM_VIEWS_FILE = Path("/tmp/kitebird-team-views.json")
 TEAMS_DIR = Path(os.path.expanduser("~/ClawSystem/Obsidian/Agents/Teams"))
 SIGNALS_BOOK_FILE = Path("/tmp/kitebird-signals-book.json")
+ETF_PORTFOLIO_FILE = Path("/tmp/kitebird-etf-portfolio.json")
 SCREENSHOTS_DIR = Path(os.path.expanduser("~/ClawSystem/Control/Dux/tools/dashboard/screenshots"))
 
 # ═══════════════════════════════════════════════════════════════════
@@ -320,6 +321,60 @@ def compute_portfolio():
         "updated": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
     }
 
+
+# ═══════════════════════════════════════════════════════════════════
+# DATA — ETF MIRROR PORTFOLIO
+# ═══════════════════════════════════════════════════════════════════
+
+def _default_etf_portfolio():
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    return {
+        "starting_capital": 10000,
+        "portfolio_name": "ETF Mirror Portfolio",
+        "description": "Mirrors main portfolio using ETFs and ETF options.",
+        "strategies": [
+            {"name": "SPY Options", "allocation_pct": 40, "allocated": 4000, "mirrors": "SPX Put Spreads"},
+            {"name": "Crypto ETF", "allocation_pct": 45, "allocated": 4500, "mirrors": "Crypto Funding"},
+            {"name": "Currency ETF", "allocation_pct": 15, "allocated": 1500, "mirrors": "Forex Carry"},
+        ],
+        "positions": [],
+        "trades": [],
+        "created": now,
+    }
+
+def load_etf_portfolio():
+    if not ETF_PORTFOLIO_FILE.exists():
+        data = _default_etf_portfolio()
+        ETF_PORTFOLIO_FILE.write_text(json.dumps(data, indent=2))
+        return data
+    try:
+        return json.loads(ETF_PORTFOLIO_FILE.read_text())
+    except:
+        data = _default_etf_portfolio()
+        ETF_PORTFOLIO_FILE.write_text(json.dumps(data, indent=2))
+        return data
+
+def save_etf_portfolio(data):
+    ETF_PORTFOLIO_FILE.write_text(json.dumps(data, indent=2))
+
+def compute_etf_portfolio():
+    data = load_etf_portfolio()
+    total_value = sum(p.get("current_value", 0) for p in data.get("positions", []))
+    if not total_value and data.get("positions"):
+        total_value = data["starting_capital"]
+    total_pnl = total_value - data["starting_capital"]
+    return {
+        "portfolio_name": data.get("portfolio_name", "ETF Mirror Portfolio"),
+        "description": data.get("description", ""),
+        "starting_capital": data["starting_capital"],
+        "total_value": round(total_value, 2),
+        "total_pnl": round(total_pnl, 2),
+        "total_pnl_pct": round(total_pnl / data["starting_capital"] * 100, 2) if data["starting_capital"] else 0,
+        "strategies": data.get("strategies", []),
+        "positions": data.get("positions", []),
+        "trades": data.get("trades", [])[-50:],
+        "updated": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
 
 # ═══════════════════════════════════════════════════════════════════
 # DATA — NEWS & SIGNALS
@@ -676,6 +731,27 @@ def api_signals_screenshot_serve(filename):
     from flask import send_from_directory
     return send_from_directory(str(SCREENSHOTS_DIR), filename)
 
+@app.route("/api/etf")
+def api_etf():
+    return jsonify(compute_etf_portfolio())
+
+@app.route("/api/etf/trade", methods=["POST"])
+def api_etf_trade():
+    trade = request.get_json()
+    if not trade:
+        return jsonify({"error": "no data"}), 400
+    data = load_etf_portfolio()
+    trade["timestamp"] = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    data.setdefault("trades", []).append(trade)
+    if "position_id" in trade and "new_value" in trade:
+        for p in data.get("positions", []):
+            if p.get("id") == trade["position_id"]:
+                p["current_value"] = float(trade["new_value"])
+                p["pnl"] = round(p["current_value"] - p.get("cost_basis", 0), 2)
+                p["status"] = trade.get("status", p.get("status", "open"))
+    save_etf_portfolio(data)
+    return jsonify({"ok": True})
+
 @app.route("/api/org")
 def api_org():
     with lock:
@@ -834,6 +910,7 @@ tr:hover{background:#ffffff06}
   <button class="nav-btn active" onclick="showPage('trading',this)">📊 Trading</button>
   <button class="nav-btn" onclick="showPage('portfolio',this)">📈 Portfolio</button>
   <button class="nav-btn" onclick="showPage('news',this)">📰 News & Signals</button>
+  <button class="nav-btn" onclick="showPage('etf',this)">🏦 ETF Mirror</button>
   <button class="nav-btn" onclick="showPage('ops',this)">⚙️ Ops & Costs</button>
   <button class="nav-btn" onclick="showPage('org',this)">🏢 Org Overview</button>
   <div class="nav-right">
@@ -864,6 +941,12 @@ tr:hover{background:#ffffff06}
   <div class="footer">Sources: Yahoo Finance RSS, Polymarket • Team views stored locally</div>
 </div>
 
+<!-- ═══ ETF MIRROR PAGE ═══ -->
+<div class="page" id="page-etf">
+  <div id="etf-content"><div class="loading">Loading ETF mirror portfolio…</div></div>
+  <div class="footer">ETF Mirror Portfolio • Mirrors main trades via ETFs/options • $10K paper capital</div>
+</div>
+
 <!-- ═══ OPS PAGE ═══ -->
 <div class="page" id="page-ops">
   <div id="ops-content"><div class="loading">Loading ops data…</div></div>
@@ -887,6 +970,7 @@ function showPage(name, btn) {
   if (name === 'trading') loadTrading();
   if (name === 'portfolio') loadPortfolio();
   if (name === 'news') loadNews();
+  if (name === 'etf') loadETF();
   if (name === 'org') loadOrg();
 }
 
@@ -1300,6 +1384,63 @@ async function loadNews(){
 async function loadOrg(){
   try{const r=await fetch('/api/org');const d=await r.json();renderOrg(d)}catch(e){console.error(e)}
 }
+async function loadETF(){
+  try{const r=await fetch('/api/etf');const d=await r.json();renderETF(d)}catch(e){console.error(e)}
+}
+
+function renderETF(d) {
+  const el = $('etf-content');
+  if (!d || d.error) { el.innerHTML='<div class="card">Error loading ETF data</div>'; return; }
+  const pnlColor = d.total_pnl >= 0 ? 'var(--green)' : 'var(--red)';
+  const openPos = d.positions.filter(p => p.status === 'open');
+  const monPos = d.positions.filter(p => p.status === 'monitoring');
+  const closedPos = d.positions.filter(p => p.status === 'closed');
+
+  let h = '<div class="big-stats">';
+  h += '<div class="big-stat"><div class="label">Starting Capital</div><div class="num">$'+d.starting_capital.toLocaleString()+'</div></div>';
+  h += '<div class="big-stat"><div class="label">Portfolio Value</div><div class="num" style="color:'+pnlColor+'">$'+d.total_value.toLocaleString()+'</div></div>';
+  h += '<div class="big-stat"><div class="label">Total P&L</div><div class="num" style="color:'+pnlColor+'">$'+d.total_pnl.toFixed(2)+' ('+d.total_pnl_pct.toFixed(1)+'%)</div></div>';
+  h += '<div class="big-stat"><div class="label">Open / Monitoring</div><div class="num">'+openPos.length+' / '+monPos.length+'</div></div>';
+  h += '</div>';
+
+  // Strategy allocation with mirror info
+  h += '<div class="card full"><h3>📊 Strategy Allocation (ETF Mirror)</h3><table><thead><tr><th>ETF Strategy</th><th>Mirrors</th><th>Alloc %</th><th>Allocated</th></tr></thead><tbody>';
+  for (const s of d.strategies) {
+    h += '<tr><td>'+s.name+'</td><td style="color:var(--dim)">'+(s.mirrors||'-')+'</td><td>'+s.allocation_pct+'%</td><td>$'+s.allocated.toLocaleString()+'</td></tr>';
+  }
+  h += '</tbody></table></div>';
+
+  // Open positions
+  if (openPos.length > 0 || monPos.length > 0) {
+    h += '<div class="card full"><h3>📈 Open Positions</h3><table><thead><tr><th>Strategy</th><th>Trade</th><th>Ticker</th><th>Entry</th><th>Value</th><th>P&L</th><th>Status</th></tr></thead><tbody>';
+    for (const p of [...openPos, ...monPos]) {
+      const pc = p.pnl >= 0 ? 'var(--green)' : 'var(--red)';
+      const statusBadge = p.status === 'monitoring' ? '<span style="color:var(--yellow)">👁 Monitoring</span>' : '<span style="color:var(--green)">● Open</span>';
+      h += '<tr><td>'+p.strategy+'</td><td style="font-size:12px">'+p.description+'</td><td><strong>'+(p.ticker||'-')+'</strong></td><td>'+p.entry_price+'</td><td>$'+p.current_value.toLocaleString()+'</td><td style="color:'+pc+'">$'+p.pnl.toFixed(2)+'</td><td>'+statusBadge+'</td></tr>';
+    }
+    h += '</tbody></table></div>';
+  }
+
+  // Mirrors reference
+  h += '<div class="card full"><h3>🔗 Mirror Mapping</h3><table><thead><tr><th>ETF Position</th><th>Mirrors (Main Portfolio)</th><th>Notes</th></tr></thead><tbody>';
+  for (const p of d.positions) {
+    h += '<tr><td><strong>'+(p.ticker||'-')+'</strong> — '+(p.description||'').substring(0,50)+'</td><td style="color:var(--dim)">'+(p.mirrors||'-')+'</td><td style="font-size:11px">'+(p.notes||'').substring(0,80)+'</td></tr>';
+  }
+  h += '</tbody></table></div>';
+
+  // Trade log
+  if (d.trades && d.trades.length > 0) {
+    h += '<div class="card full"><h3>📝 Trade Log</h3><table><thead><tr><th>Time</th><th>Action</th><th>Description</th><th>Strategy</th></tr></thead><tbody>';
+    for (const t of d.trades.slice(-20).reverse()) {
+      const ac = t.action==='OPEN'?'var(--green)':t.action==='CLOSE'?'var(--red)':'var(--yellow)';
+      h += '<tr><td>'+t.timestamp+'</td><td style="color:'+ac+'">'+t.action+'</td><td>'+t.description+'</td><td>'+t.strategy+'</td></tr>';
+    }
+    h += '</tbody></table></div>';
+  }
+
+  h += '<div style="color:var(--dim);font-size:11px;margin-top:8px">Updated: '+d.updated+'</div>';
+  el.innerHTML = h;
+}
 
 // Initial load
 loadTrading();
@@ -1311,6 +1452,7 @@ setInterval(function(){
   if(id==='page-ops') loadOps();
   if(id==='page-portfolio') loadPortfolio();
   if(id==='page-news') loadNews();
+  if(id==='page-etf') loadETF();
   if(id==='page-org') loadOrg();
 },60000);
 </script>
