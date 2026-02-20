@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Kitebird Capital — Unified Dashboard (Trading + Ops Cost Monitor)."""
+"""Kitebird Capital — Unified Dashboard (Trading + Portfolio + News & Signals + Ops + Org)."""
 
 from flask import Flask, jsonify, render_template_string, request
-import threading, time, json, requests, datetime, os
+import threading, time, json, requests, datetime, os, re, glob
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -12,7 +12,15 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
 # ─── Shared cache ───────────────────────────────────────────────────
 cache = {"vix": None, "funding": None, "arb": None, "updated": None}
 ops_cache = {"sessions": [], "totals": {}, "updated": None}
+portfolio_cache = {"updated": None}
+news_cache = {"headlines": [], "updated": None}
+signals_cache = {"markets": [], "updated": None}
+org_cache = {"teams": [], "updated": None}
 lock = threading.Lock()
+
+PORTFOLIO_FILE = Path("/tmp/kitebird-portfolio.json")
+TEAM_VIEWS_FILE = Path("/tmp/kitebird-team-views.json")
+TEAMS_DIR = Path(os.path.expanduser("~/ClawSystem/Obsidian/Agents/Teams"))
 
 # ═══════════════════════════════════════════════════════════════════
 # DATA FETCHERS — TRADING
@@ -167,7 +175,6 @@ def fetch_funding():
 # DATA — OPS COST MONITOR
 # ═══════════════════════════════════════════════════════════════════
 
-# Model cost table (per 1M tokens, input/output)
 MODEL_COSTS = {
     "claude-opus-4-6":       {"input": 15.0, "output": 75.0, "tier": "T1-Frontier"},
     "claude-sonnet-4-6":     {"input": 3.0,  "output": 15.0, "tier": "T2-Workhorse"},
@@ -175,7 +182,6 @@ MODEL_COSTS = {
     "deepseek-r1":           {"input": 0.55, "output": 2.19, "tier": "T4-DeepThink"},
 }
 
-# Tier policy: what model should be used for what
 TIER_POLICY = {
     "main":      {"expected": "T1-Frontier",   "model": "claude-opus-4-6"},
     "subagent":  {"expected": "T2-Workhorse",  "model": "claude-sonnet-4-6"},
@@ -183,11 +189,9 @@ TIER_POLICY = {
     "research":  {"expected": "T4-DeepThink",   "model": "deepseek-r1"},
 }
 
-# Cost log file — agents append entries here
 COST_LOG = Path(os.environ.get("COST_LOG", "/tmp/kitebird-cost-log.jsonl"))
 
 def load_cost_log():
-    """Load cost entries from JSONL log file."""
     entries = []
     if COST_LOG.exists():
         for line in COST_LOG.read_text().strip().split("\n"):
@@ -199,12 +203,9 @@ def load_cost_log():
     return entries
 
 def compute_ops_data():
-    """Compute ops metrics from cost log + hardcoded baseline."""
     entries = load_cost_log()
     now = datetime.datetime.utcnow()
     today = now.strftime("%Y-%m-%d")
-
-    # Hardcoded initial data from today's actual usage
     sessions = [
         {"name": "Trading Report", "type": "subagent", "model": "Sonnet 4.6",
          "tier": "T2", "tokens_in": 23000, "tokens_out": 3500,
@@ -215,8 +216,6 @@ def compute_ops_data():
          "cost_actual": 0.66, "cost_opus": 2.60, "savings": 1.94,
          "mfs": 5, "status": "✅", "time": "15:39"},
     ]
-
-    # Add any logged entries
     for e in entries:
         if e.get("date", "") == today:
             model = e.get("model", "unknown")
@@ -230,19 +229,13 @@ def compute_ops_data():
             actual = (tin * tier_info["input"] / 1e6 + tout * tier_info["output"] / 1e6) if tier_info else 0
             opus = tin * 15.0 / 1e6 + tout * 75.0 / 1e6
             sessions.append({
-                "name": e.get("name", "Unknown"),
-                "type": e.get("type", "subagent"),
-                "model": model,
-                "tier": tier_info["tier"][:2] if tier_info else "??",
+                "name": e.get("name", "Unknown"), "type": e.get("type", "subagent"),
+                "model": model, "tier": tier_info["tier"][:2] if tier_info else "??",
                 "tokens_in": tin, "tokens_out": tout,
-                "cost_actual": round(actual, 2),
-                "cost_opus": round(opus, 2),
-                "savings": round(opus - actual, 2),
-                "mfs": e.get("mfs", 4),
-                "status": "✅",
-                "time": e.get("time", "--:--"),
+                "cost_actual": round(actual, 2), "cost_opus": round(opus, 2),
+                "savings": round(opus - actual, 2), "mfs": e.get("mfs", 4),
+                "status": "✅", "time": e.get("time", "--:--"),
             })
-
     total_actual = sum(s["cost_actual"] for s in sessions)
     total_opus = sum(s["cost_opus"] for s in sessions)
     total_savings = sum(s["savings"] for s in sessions)
@@ -250,18 +243,13 @@ def compute_ops_data():
     pct_savings = (total_savings / total_opus * 100) if total_opus > 0 else 0
     underpowered = sum(1 for s in sessions if s["mfs"] <= 2)
     overpowered = sum(1 for s in sessions if s.get("type") != "main" and s["tier"] == "T1")
-
     return {
         "sessions": sessions,
         "totals": {
-            "actual": round(total_actual, 2),
-            "opus_baseline": round(total_opus, 2),
-            "savings": round(total_savings, 2),
-            "pct_savings": round(pct_savings, 1),
-            "avg_mfs": round(avg_mfs, 1),
-            "underpowered_alerts": underpowered,
-            "overpowered_alerts": overpowered,
-            "session_count": len(sessions),
+            "actual": round(total_actual, 2), "opus_baseline": round(total_opus, 2),
+            "savings": round(total_savings, 2), "pct_savings": round(pct_savings, 1),
+            "avg_mfs": round(avg_mfs, 1), "underpowered_alerts": underpowered,
+            "overpowered_alerts": overpowered, "session_count": len(sessions),
         },
         "tiers": {
             "T1": {"name": "Frontier (Opus)", "cost": "$75/1M", "color": "#a855f7", "use": "Main session, high-stakes"},
@@ -278,6 +266,209 @@ def compute_ops_data():
     }
 
 
+# ═══════════════════════════════════════════════════════════════════
+# DATA — PORTFOLIO (Paper Trading)
+# ═══════════════════════════════════════════════════════════════════
+
+def _default_portfolio():
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    return {
+        "starting_capital": 10000,
+        "strategies": [
+            {"name": "SPX Put Spreads", "allocation_pct": 40, "allocated": 4000},
+            {"name": "Crypto Funding", "allocation_pct": 45, "allocated": 4500},
+            {"name": "Forex Carry", "allocation_pct": 15, "allocated": 1500},
+        ],
+        "positions": [
+            {"strategy": "SPX Put Spreads", "entry_date": now, "entry_price": 4000.00, "current_value": 4000.00, "pnl": 0, "status": "open"},
+            {"strategy": "Crypto Funding", "entry_date": now, "entry_price": 4500.00, "current_value": 4500.00, "pnl": 0, "status": "open"},
+            {"strategy": "Forex Carry", "entry_date": now, "entry_price": 1500.00, "current_value": 1500.00, "pnl": 0, "status": "open"},
+        ],
+        "trades": [],
+        "created": now,
+    }
+
+def load_portfolio():
+    if not PORTFOLIO_FILE.exists():
+        data = _default_portfolio()
+        PORTFOLIO_FILE.write_text(json.dumps(data, indent=2))
+        return data
+    try:
+        return json.loads(PORTFOLIO_FILE.read_text())
+    except:
+        data = _default_portfolio()
+        PORTFOLIO_FILE.write_text(json.dumps(data, indent=2))
+        return data
+
+def save_portfolio(data):
+    PORTFOLIO_FILE.write_text(json.dumps(data, indent=2))
+
+def compute_portfolio():
+    data = load_portfolio()
+    total_value = sum(p["current_value"] for p in data["positions"])
+    total_pnl = total_value - data["starting_capital"]
+    return {
+        "starting_capital": data["starting_capital"],
+        "total_value": round(total_value, 2),
+        "total_pnl": round(total_pnl, 2),
+        "total_pnl_pct": round(total_pnl / data["starting_capital"] * 100, 2) if data["starting_capital"] else 0,
+        "strategies": data["strategies"],
+        "positions": data["positions"],
+        "trades": data.get("trades", [])[-50:],  # last 50
+        "updated": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DATA — NEWS & SIGNALS
+# ═══════════════════════════════════════════════════════════════════
+
+def fetch_news():
+    """Fetch financial news from Yahoo Finance RSS."""
+    headlines = []
+    url = "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC&region=US&lang=en-US"
+    try:
+        try:
+            import feedparser
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:20]:
+                pub = ""
+                if hasattr(entry, "published_parsed") and entry.published_parsed:
+                    pub = time.strftime("%Y-%m-%d %H:%M", entry.published_parsed)
+                headlines.append({
+                    "title": entry.get("title", ""),
+                    "link": entry.get("link", ""),
+                    "published": pub,
+                    "source": "Yahoo Finance",
+                })
+        except ImportError:
+            # Fallback: raw XML parsing
+            import xml.etree.ElementTree as ET
+            r = requests.get(url, timeout=10, headers=HEADERS)
+            if r.status_code == 200:
+                root = ET.fromstring(r.content)
+                for item in root.iter("item"):
+                    title = item.findtext("title", "")
+                    link = item.findtext("link", "")
+                    pub = item.findtext("pubDate", "")
+                    headlines.append({
+                        "title": title,
+                        "link": link,
+                        "published": pub[:16] if pub else "",
+                        "source": "Yahoo Finance",
+                    })
+                headlines = headlines[:20]
+    except Exception as e:
+        headlines = [{"title": f"Error fetching news: {e}", "link": "", "published": "", "source": "error"}]
+    return headlines
+
+def fetch_signals():
+    """Fetch polymarket data and compare with team views."""
+    poly = _fetch_polymarket()
+    team_views = load_team_views()
+    signals = []
+    for m in poly[:30]:
+        market_pct = round(m["yes"] * 100, 1)
+        team_entry = team_views.get(m["raw_title"], {})
+        team_pct = team_entry.get("estimate")
+        spread = None
+        dislocation = False
+        if team_pct is not None:
+            spread = round(team_pct - market_pct, 1)
+            dislocation = abs(spread) > 10
+        signals.append({
+            "title": m["raw_title"],
+            "market_pct": market_pct,
+            "team_pct": team_pct,
+            "spread": spread,
+            "dislocation": dislocation,
+            "source": m["source"],
+        })
+    # Sort: dislocations first
+    signals.sort(key=lambda x: (not x["dislocation"], -(abs(x["spread"]) if x["spread"] is not None else 0)))
+    return signals
+
+def load_team_views():
+    if not TEAM_VIEWS_FILE.exists():
+        return {}
+    try:
+        return json.loads(TEAM_VIEWS_FILE.read_text())
+    except:
+        return {}
+
+def save_team_view(title, estimate):
+    views = load_team_views()
+    views[title] = {"estimate": estimate, "updated": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M")}
+    TEAM_VIEWS_FILE.write_text(json.dumps(views, indent=2))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DATA — ORG OVERVIEW
+# ═══════════════════════════════════════════════════════════════════
+
+def parse_team_file(filepath):
+    """Parse a team markdown file for tasks and tables."""
+    name = filepath.stem
+    try:
+        text = filepath.read_text()
+    except:
+        return {"name": name, "tasks": [], "tables": [], "error": "Could not read file"}
+
+    tasks = []
+    # Parse checkbox tasks
+    for line in text.split("\n"):
+        line_stripped = line.strip()
+        if line_stripped.startswith("- [x]"):
+            tasks.append({"text": line_stripped[6:].strip()[:80], "done": True})
+        elif line_stripped.startswith("- [ ]"):
+            tasks.append({"text": line_stripped[6:].strip()[:80], "done": False})
+
+    # Parse markdown tables
+    tables = []
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("|") and line.endswith("|"):
+            table_lines = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                row = lines[i].strip()
+                cells = [c.strip() for c in row.split("|")[1:-1]]
+                if cells and not all(set(c) <= set("- :") for c in cells):  # skip separator rows
+                    table_lines.append(cells)
+                i += 1
+            if table_lines:
+                tables.append({"headers": table_lines[0], "rows": table_lines[1:]})
+            continue
+        i += 1
+
+    total = len(tasks)
+    done = sum(1 for t in tasks if t["done"])
+    return {
+        "name": name,
+        "total_tasks": total,
+        "completed": done,
+        "completion_pct": round(done / total * 100) if total else 0,
+        "open_tasks": [t for t in tasks if not t["done"]][:10],
+        "tables": tables[:5],
+    }
+
+def compute_org():
+    team_files = ["Trading.md", "Operations.md", "Business.md", "KintsugiFund.md", "Efficiency.md"]
+    teams = []
+    for fname in team_files:
+        fp = TEAMS_DIR / fname
+        if fp.exists():
+            teams.append(parse_team_file(fp))
+        else:
+            teams.append({"name": fname.replace(".md", ""), "total_tasks": 0, "completed": 0,
+                          "completion_pct": 0, "open_tasks": [], "tables": [], "error": "File not found"})
+    return {
+        "teams": teams,
+        "updated": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
+
+
 # ─── Background refresh ─────────────────────────────────────────────
 def refresh():
     while True:
@@ -285,12 +476,20 @@ def refresh():
         funding = fetch_funding()
         arb = fetch_arb()
         ops = compute_ops_data()
+        news = fetch_news()
+        sigs = fetch_signals()
+        org = compute_org()
         with lock:
             cache["vix"] = vix
             cache["funding"] = funding
             cache["arb"] = arb
             cache["updated"] = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
             ops_cache.update(ops)
+            news_cache["headlines"] = news
+            news_cache["updated"] = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            signals_cache["markets"] = sigs
+            signals_cache["updated"] = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            org_cache.update(org)
         time.sleep(300)
 
 threading.Thread(target=refresh, daemon=True).start()
@@ -311,7 +510,6 @@ def api_ops():
 
 @app.route("/api/ops/log", methods=["POST"])
 def api_ops_log():
-    """Agents POST cost entries here."""
     entry = request.get_json()
     if not entry:
         return jsonify({"error": "no data"}), 400
@@ -320,6 +518,52 @@ def api_ops_log():
     with open(COST_LOG, "a") as f:
         f.write(json.dumps(entry) + "\n")
     return jsonify({"ok": True})
+
+@app.route("/api/portfolio")
+def api_portfolio():
+    return jsonify(compute_portfolio())
+
+@app.route("/api/portfolio/trade", methods=["POST"])
+def api_portfolio_trade():
+    trade = request.get_json()
+    if not trade:
+        return jsonify({"error": "no data"}), 400
+    data = load_portfolio()
+    trade["timestamp"] = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    data.setdefault("trades", []).append(trade)
+    # Update positions if provided
+    if "strategy" in trade and "new_value" in trade:
+        for p in data["positions"]:
+            if p["strategy"] == trade["strategy"]:
+                old = p["current_value"]
+                p["current_value"] = float(trade["new_value"])
+                p["pnl"] = round(p["current_value"] - p["entry_price"], 2)
+                p["status"] = trade.get("status", p["status"])
+    save_portfolio(data)
+    return jsonify({"ok": True})
+
+@app.route("/api/news")
+def api_news():
+    with lock:
+        return jsonify(news_cache)
+
+@app.route("/api/signals")
+def api_signals():
+    with lock:
+        return jsonify(signals_cache)
+
+@app.route("/api/signals/view", methods=["POST"])
+def api_signals_view():
+    body = request.get_json()
+    if not body or "title" not in body or "estimate" not in body:
+        return jsonify({"error": "need title and estimate"}), 400
+    save_team_view(body["title"], float(body["estimate"]))
+    return jsonify({"ok": True})
+
+@app.route("/api/org")
+def api_org():
+    with lock:
+        return jsonify(org_cache)
 
 @app.route("/")
 def index():
@@ -336,17 +580,17 @@ HTML = r"""<!DOCTYPE html>
 <title>Kitebird Capital</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#0a0e17;--card:#111827;--border:#1e293b;--text:#e2e8f0;--dim:#64748b;--green:#22c55e;--yellow:#eab308;--red:#ef4444;--blue:#3b82f6;--cyan:#06b6d4;--purple:#a855f7}
+:root{--bg:#0a0e17;--card:#111827;--border:#1e293b;--text:#e2e8f0;--dim:#64748b;--green:#22c55e;--yellow:#eab308;--red:#ef4444;--blue:#3b82f6;--cyan:#06b6d4;--purple:#a855f7;--orange:#f97316}
 body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px;min-height:100vh;min-height:100dvh;overflow-x:hidden}
 
 /* ─── NAV ─── */
-.topnav{position:sticky;top:0;z-index:100;background:#0d1117;border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 16px;height:52px;gap:8px;-webkit-overflow-scrolling:touch}
-.topnav .logo{font-size:15px;font-weight:700;color:var(--cyan);white-space:nowrap;margin-right:12px;letter-spacing:1px}
+.topnav{position:sticky;top:0;z-index:100;background:#0d1117;border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 16px;height:52px;gap:8px;-webkit-overflow-scrolling:touch;overflow-x:auto}
+.topnav .logo{font-size:15px;font-weight:700;color:var(--cyan);white-space:nowrap;margin-right:12px;letter-spacing:1px;flex-shrink:0}
 .topnav .logo span{color:var(--dim);font-weight:400;font-size:12px}
-.nav-btn{background:none;border:1px solid transparent;color:var(--dim);padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;white-space:nowrap;transition:all .15s}
+.nav-btn{background:none;border:1px solid transparent;color:var(--dim);padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;white-space:nowrap;transition:all .15s;flex-shrink:0}
 .nav-btn:hover{color:var(--text);background:#ffffff08}
 .nav-btn.active{color:var(--cyan);border-color:var(--cyan);background:#06b6d410}
-.nav-right{margin-left:auto;display:flex;align-items:center;gap:8px}
+.nav-right{margin-left:auto;display:flex;align-items:center;gap:8px;flex-shrink:0}
 .clock{color:var(--dim);font-size:12px;font-family:'SF Mono',Monaco,monospace;white-space:nowrap}
 
 /* ─── PAGE ─── */
@@ -367,7 +611,7 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 .stat-row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #1a1f2e;font-size:13px}
 .stat-row .label{color:var(--dim)}.stat-row .val{color:var(--text);font-weight:500}
 
-/* ─── BIG STATS (Ops) ─── */
+/* ─── BIG STATS ─── */
 .big-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:16px}
 .big-stat{background:#0d1117;border:1px solid var(--border);border-radius:10px;padding:14px;text-align:center}
 .big-stat .num{font-size:28px;font-weight:700;line-height:1.2}
@@ -412,6 +656,35 @@ tr:hover{background:#ffffff06}
 .policy-banner{background:#ef444415;border:1px solid #ef444440;border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:13px;display:flex;align-items:center;gap:8px}
 .policy-banner .icon{font-size:18px}
 
+/* ─── PIE CHART (CSS only) ─── */
+.pie-container{display:flex;align-items:center;gap:20px;margin:12px 0}
+.pie{width:120px;height:120px;border-radius:50%;position:relative;flex-shrink:0}
+.pie-legend{display:flex;flex-direction:column;gap:6px}
+.pie-legend-item{display:flex;align-items:center;gap:8px;font-size:13px}
+.pie-legend-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+
+/* ─── DISLOCATION ALERT ─── */
+.dislocation{background:#ef444418;border:1px solid #ef444440;border-radius:8px;padding:10px 14px;margin-bottom:8px}
+.dislocation .dis-title{font-weight:600;color:var(--red);font-size:13px}
+.dislocation .dis-detail{font-size:12px;color:var(--dim);margin-top:4px}
+
+/* ─── NEWS ITEM ─── */
+.news-item{padding:10px 0;border-bottom:1px solid #1a1f2e}
+.news-item:last-child{border-bottom:none}
+.news-item .news-title{font-size:13px;color:var(--text);text-decoration:none;font-weight:500}
+.news-item .news-title:hover{color:var(--cyan)}
+.news-item .news-meta{font-size:11px;color:var(--dim);margin-top:3px}
+
+/* ─── TEAM VIEW INPUT ─── */
+.team-input{display:flex;gap:6px;align-items:center;margin-top:4px}
+.team-input input{background:#0d1117;border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;width:60px;font-size:12px}
+.team-input button{background:var(--cyan);color:#000;border:none;padding:4px 10px;border-radius:4px;font-size:11px;cursor:pointer;font-weight:600}
+.team-input button:hover{opacity:0.85}
+
+/* ─── ORG PROGRESS BAR ─── */
+.progress-bar{background:#1e293b;border-radius:4px;height:8px;overflow:hidden;margin-top:4px}
+.progress-bar .fill{height:100%;border-radius:4px;transition:width .3s}
+
 /* ─── FOOTER ─── */
 .footer{text-align:center;padding:16px;color:var(--dim);font-size:11px;border-top:1px solid var(--border);margin-top:16px}
 
@@ -429,6 +702,7 @@ tr:hover{background:#ffffff06}
   .page{padding:10px}
   .big-stat .num{font-size:22px}
   .hide-mobile{display:none}
+  .pie{width:90px;height:90px}
 }
 @media(max-width:420px){
   .big-stats{grid-template-columns:1fr 1fr}
@@ -441,8 +715,11 @@ tr:hover{background:#ffffff06}
 <!-- ═══ NAVIGATION ═══ -->
 <nav class="topnav">
   <div class="logo">KITEBIRD <span>CAPITAL</span></div>
-  <button class="nav-btn active" onclick="showPage('trading')">📊 Trading</button>
-  <button class="nav-btn" onclick="showPage('ops')">⚙️ Ops & Costs</button>
+  <button class="nav-btn active" onclick="showPage('trading',this)">📊 Trading</button>
+  <button class="nav-btn" onclick="showPage('portfolio',this)">📈 Portfolio</button>
+  <button class="nav-btn" onclick="showPage('news',this)">📰 News & Signals</button>
+  <button class="nav-btn" onclick="showPage('ops',this)">⚙️ Ops & Costs</button>
+  <button class="nav-btn" onclick="showPage('org',this)">🏢 Org Overview</button>
   <div class="nav-right">
     <span class="clock" id="clock"></span>
   </div>
@@ -459,21 +736,42 @@ tr:hover{background:#ffffff06}
   <div class="footer">Auto-refresh every 5 min • Sources: Yahoo Finance, Binance, Bybit, Gate.io, Polymarket, Kalshi</div>
 </div>
 
+<!-- ═══ PORTFOLIO PAGE ═══ -->
+<div class="page" id="page-portfolio">
+  <div id="portfolio-content"><div class="loading">Loading portfolio…</div></div>
+  <div class="footer">Paper trading portfolio • $10K starting capital • Auto-refresh every 60s</div>
+</div>
+
+<!-- ═══ NEWS & SIGNALS PAGE ═══ -->
+<div class="page" id="page-news">
+  <div id="news-content"><div class="loading">Loading news & signals…</div></div>
+  <div class="footer">Sources: Yahoo Finance RSS, Polymarket • Team views stored locally</div>
+</div>
+
 <!-- ═══ OPS PAGE ═══ -->
 <div class="page" id="page-ops">
   <div id="ops-content"><div class="loading">Loading ops data…</div></div>
   <div class="footer">Model tiering active since Feb 20, 2026 • Baseline: All-Opus ($75/1M output tokens)</div>
 </div>
 
+<!-- ═══ ORG PAGE ═══ -->
+<div class="page" id="page-org">
+  <div id="org-content"><div class="loading">Loading org overview…</div></div>
+  <div class="footer">Data from ~/ClawSystem/Obsidian/Agents/Teams/ • Auto-refresh every 5 min</div>
+</div>
+
 <script>
 // ─── Navigation ──────────────────────────────────────────────
-function showPage(name) {
+function showPage(name, btn) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('page-'+name).classList.add('active');
-  event.target.classList.add('active');
+  if(btn) btn.classList.add('active');
   if (name === 'ops') loadOps();
   if (name === 'trading') loadTrading();
+  if (name === 'portfolio') loadPortfolio();
+  if (name === 'news') loadNews();
+  if (name === 'org') loadOrg();
 }
 
 // ─── Clock ───────────────────────────────────────────────────
@@ -495,6 +793,9 @@ function tierBadge(tier) {
   const cls = t.startsWith('t1') ? 't1' : t.startsWith('t2') ? 't2' : t.startsWith('t3') ? 't3' : 't4';
   return '<span class="badge '+cls+'">'+tier+'</span>';
 }
+
+function pnlClass(v) { return v >= 0 ? 'pos' : 'neg'; }
+function pnlSign(v) { return v >= 0 ? '+$'+v.toFixed(2) : '-$'+Math.abs(v).toFixed(2); }
 
 // ═══ TRADING RENDER ══════════════════════════════════════════
 function renderTrading(d){
@@ -547,6 +848,159 @@ function renderTrading(d){
   }
 }
 
+// ═══ PORTFOLIO RENDER ════════════════════════════════════════
+function renderPortfolio(d) {
+  let html = '';
+
+  // Big stats
+  html += '<div class="big-stats">';
+  html += '<div class="big-stat neutral"><div class="num">$'+d.total_value.toLocaleString()+'</div><div class="lbl">Total Value</div></div>';
+  html += '<div class="big-stat '+(d.total_pnl>=0?'savings':'alert-red')+'"><div class="num">'+pnlSign(d.total_pnl)+'</div><div class="lbl">Total P&L</div></div>';
+  html += '<div class="big-stat neutral"><div class="num">'+d.total_pnl_pct+'%</div><div class="lbl">Return</div></div>';
+  html += '<div class="big-stat neutral"><div class="num">$'+d.starting_capital.toLocaleString()+'</div><div class="lbl">Starting Capital</div></div>';
+  html += '</div>';
+
+  // Allocation pie + strategies
+  html += '<div class="grid">';
+
+  // Pie card
+  const colors = ['#3b82f6','#22c55e','#eab308'];
+  let conic = '';
+  let pct = 0;
+  d.strategies.forEach(function(s,i){
+    const end = pct + s.allocation_pct;
+    conic += (i>0?',':'') + colors[i]+' '+pct+'% '+end+'%';
+    pct = end;
+  });
+  html += '<div class="card"><h2><span class="icon">🥧</span> ALLOCATION</h2>';
+  html += '<div class="pie-container">';
+  html += '<div class="pie" style="background:conic-gradient('+conic+')"></div>';
+  html += '<div class="pie-legend">';
+  d.strategies.forEach(function(s,i){
+    html += '<div class="pie-legend-item"><div class="pie-legend-dot" style="background:'+colors[i]+'"></div>'+s.name+' ('+s.allocation_pct+'% / $'+s.allocated.toLocaleString()+')</div>';
+  });
+  html += '</div></div></div>';
+
+  // Summary card
+  html += '<div class="card"><h2><span class="icon">📊</span> SUMMARY</h2>';
+  html += '<div class="stat-row"><span class="label">Starting Capital</span><span class="val">$'+d.starting_capital.toLocaleString()+'</span></div>';
+  html += '<div class="stat-row"><span class="label">Current Value</span><span class="val">$'+d.total_value.toLocaleString()+'</span></div>';
+  html += '<div class="stat-row"><span class="label">Total P&L</span><span class="val '+pnlClass(d.total_pnl)+'">'+pnlSign(d.total_pnl)+' ('+d.total_pnl_pct+'%)</span></div>';
+  html += '<div class="stat-row"><span class="label">Strategies</span><span class="val">'+d.strategies.length+'</span></div>';
+  html += '<div class="stat-row"><span class="label">Open Positions</span><span class="val">'+d.positions.filter(function(p){return p.status==='open'}).length+'</span></div>';
+  html += '</div>';
+  html += '</div>';
+
+  // Positions table
+  html += '<div class="card full" style="margin-top:14px"><h2><span class="icon">📋</span> POSITIONS</h2>';
+  if(d.positions.length){
+    html += '<div style="overflow-x:auto"><table>';
+    html += '<tr><th>Strategy</th><th>Entry Date</th><th>Entry Price</th><th>Current Value</th><th>P&L</th><th>Status</th></tr>';
+    d.positions.forEach(function(p){
+      const pnl = p.pnl || (p.current_value - p.entry_price);
+      html += '<tr><td>'+p.strategy+'</td><td>'+p.entry_date+'</td><td>$'+p.entry_price.toFixed(2)+'</td>';
+      html += '<td>$'+p.current_value.toFixed(2)+'</td>';
+      html += '<td class="'+pnlClass(pnl)+'">'+pnlSign(pnl)+'</td>';
+      html += '<td><span class="badge">'+(p.status||'open')+'</span></td></tr>';
+    });
+    html += '</table></div>';
+  } else {
+    html += '<div class="empty">No positions yet</div>';
+  }
+  html += '</div>';
+
+  // Trade log
+  html += '<div class="card full" style="margin-top:14px"><h2><span class="icon">📝</span> TRADE LOG</h2>';
+  if(d.trades&&d.trades.length){
+    html += '<div style="overflow-x:auto"><table>';
+    html += '<tr><th>Time</th><th>Strategy</th><th>Action</th><th>Amount</th><th>Notes</th></tr>';
+    d.trades.slice().reverse().forEach(function(t){
+      html += '<tr><td>'+(t.timestamp||'—')+'</td><td>'+(t.strategy||'—')+'</td>';
+      html += '<td>'+(t.action||'—')+'</td><td>'+(t.amount?'$'+parseFloat(t.amount).toFixed(2):'—')+'</td>';
+      html += '<td style="color:var(--dim)">'+(t.notes||'')+'</td></tr>';
+    });
+    html += '</table></div>';
+  } else {
+    html += '<div class="empty">No trades logged yet. Use POST /api/portfolio/trade to log trades.</div>';
+  }
+  html += '</div>';
+
+  $('portfolio-content').innerHTML = html;
+}
+
+// ═══ NEWS & SIGNALS RENDER ═══════════════════════════════════
+function renderNews(newsData, sigData) {
+  let html = '';
+
+  // Dislocations first
+  const dislocations = (sigData.markets||[]).filter(function(s){return s.dislocation});
+  if(dislocations.length){
+    html += '<div class="card full" style="margin-bottom:14px"><h2><span class="icon">🚨</span> DISLOCATION ALERTS</h2>';
+    dislocations.forEach(function(s){
+      html += '<div class="dislocation"><div class="dis-title">⚠️ '+s.title+'</div>';
+      html += '<div class="dis-detail">Market: '+s.market_pct+'% • Team: '+s.team_pct+'% • Spread: <strong style="color:var(--red)">'+Math.abs(s.spread).toFixed(1)+'%</strong>';
+      html += ' — '+(s.spread>0?'Team MORE bullish':'Team LESS bullish')+'</div></div>';
+    });
+    html += '</div>';
+  }
+
+  html += '<div class="grid">';
+
+  // News feed
+  html += '<div class="card"><h2><span class="icon">📰</span> FINANCIAL NEWS</h2>';
+  const headlines = newsData.headlines||[];
+  if(headlines.length){
+    headlines.forEach(function(n){
+      html += '<div class="news-item">';
+      if(n.link){
+        html += '<a class="news-title" href="'+n.link+'" target="_blank">'+n.title+'</a>';
+      } else {
+        html += '<div class="news-title">'+n.title+'</div>';
+      }
+      html += '<div class="news-meta">'+n.source+(n.published?' • '+n.published:'')+'</div></div>';
+    });
+  } else {
+    html += '<div class="empty">No headlines available</div>';
+  }
+  html += '</div>';
+
+  // Signals / Team views
+  html += '<div class="card"><h2><span class="icon">🎯</span> PREDICTION MARKETS — TEAM VIEWS</h2>';
+  const markets = sigData.markets||[];
+  if(markets.length){
+    markets.slice(0,20).forEach(function(s){
+      const isDis = s.dislocation;
+      html += '<div style="padding:8px 0;border-bottom:1px solid #1a1f2e'+(isDis?';background:#ef444410;margin:0 -16px;padding-left:16px;padding-right:16px':'')+'">';
+      html += '<div style="font-size:13px;font-weight:500'+(isDis?';color:var(--red)':'')+'">'+s.title.substring(0,60)+(s.title.length>60?'…':'')+'</div>';
+      html += '<div style="display:flex;gap:12px;align-items:center;margin-top:4px;font-size:12px">';
+      html += '<span style="color:var(--dim)">Market: <strong style="color:var(--text)">'+s.market_pct+'%</strong></span>';
+      if(s.team_pct!==null){
+        html += '<span style="color:var(--dim)">Team: <strong style="color:var(--cyan)">'+s.team_pct+'%</strong></span>';
+        html += '<span style="color:'+(isDis?'var(--red)':'var(--dim)')+'">Spread: '+(s.spread>0?'+':'')+s.spread+'%</span>';
+      }
+      html += '</div>';
+      html += '<div class="team-input"><input type="number" min="0" max="100" placeholder="%" id="tv-'+btoa(s.title).substring(0,12)+'"'+(s.team_pct!==null?' value="'+s.team_pct+'"':'')+'>';
+      html += '<button onclick="setTeamView(\''+s.title.replace(/'/g,"\\'")+'\',\'tv-'+btoa(s.title).substring(0,12)+'\')">Set</button></div>';
+      html += '</div>';
+    });
+  } else {
+    html += '<div class="empty">No prediction market data</div>';
+  }
+  html += '</div>';
+
+  html += '</div>';
+  $('news-content').innerHTML = html;
+}
+
+async function setTeamView(title, inputId) {
+  const val = parseFloat(document.getElementById(inputId).value);
+  if(isNaN(val)||val<0||val>100){alert('Enter 0-100');return}
+  try {
+    await fetch('/api/signals/view',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:title,estimate:val})});
+    loadNews();
+  }catch(e){console.error(e)}
+}
+
 // ═══ OPS RENDER ══════════════════════════════════════════════
 function renderOps(d){
   const t = d.totals || {};
@@ -554,11 +1008,8 @@ function renderOps(d){
   const tiers = d.tiers || {};
 
   let html = '';
-
-  // Policy banner
   html += '<div class="policy-banner"><span class="icon">⚠️</span> <strong>Priority:</strong>&nbsp;Underpowered model usage is RED severity. Quality over savings — when in doubt, tier UP.</div>';
 
-  // Big stats
   html += '<div class="big-stats">';
   html += '<div class="big-stat savings"><div class="num">$'+(t.savings||0).toFixed(2)+'</div><div class="lbl">Saved Today</div></div>';
   html += '<div class="big-stat savings"><div class="num">'+(t.pct_savings||0)+'%</div><div class="lbl">vs Opus Baseline</div></div>';
@@ -568,30 +1019,21 @@ function renderOps(d){
   html += '<div class="big-stat neutral"><div class="num">'+(t.avg_mfs||0)+'</div><div class="lbl">Avg Model Fit</div></div>';
   html += '</div>';
 
-  // Tier legend
   html += '<div class="tier-legend">';
   for (const [key, val] of Object.entries(tiers)) {
     html += '<div class="tier-item"><div class="tier-dot" style="background:'+val.color+'"></div><div class="tier-info"><div class="tier-name">'+key+' '+val.name+'</div><div class="tier-cost">'+val.cost+' • '+val.use+'</div></div></div>';
   }
   html += '</div>';
 
-  // Session table
   html += '<div class="card full" style="margin-top:0">';
   html += '<h2><span class="icon">📋</span> SESSION LOG — TODAY</h2>';
   if (sessions.length) {
     html += '<div style="overflow-x:auto"><table>';
     html += '<tr><th>Time</th><th>Task</th><th>Model</th><th>Tier</th><th>Actual</th><th>Opus Would Be</th><th>Saved</th><th>Fit Score</th></tr>';
     sessions.forEach(function(s) {
-      html += '<tr>';
-      html += '<td>'+s.time+'</td>';
-      html += '<td>'+s.name+'</td>';
-      html += '<td>'+s.model+'</td>';
-      html += '<td>'+tierBadge(s.tier)+'</td>';
-      html += '<td>$'+s.cost_actual.toFixed(2)+'</td>';
-      html += '<td style="color:var(--dim)">$'+s.cost_opus.toFixed(2)+'</td>';
-      html += '<td class="pos">$'+s.savings.toFixed(2)+'</td>';
-      html += '<td>'+mfsDots(s.mfs)+'</td>';
-      html += '</tr>';
+      html += '<tr><td>'+s.time+'</td><td>'+s.name+'</td><td>'+s.model+'</td><td>'+tierBadge(s.tier)+'</td>';
+      html += '<td>$'+s.cost_actual.toFixed(2)+'</td><td style="color:var(--dim)">$'+s.cost_opus.toFixed(2)+'</td>';
+      html += '<td class="pos">$'+s.savings.toFixed(2)+'</td><td>'+mfsDots(s.mfs)+'</td></tr>';
     });
     html += '</table></div>';
   } else {
@@ -599,7 +1041,6 @@ function renderOps(d){
   }
   html += '</div>';
 
-  // Cost comparison
   html += '<div class="grid" style="margin-top:14px">';
   html += '<div class="card"><h2><span class="icon">💰</span> COST BREAKDOWN</h2>';
   html += '<div class="stat-row"><span class="label">Actual spend</span><span class="val pos">$'+(t.actual||0).toFixed(2)+'</span></div>';
@@ -619,6 +1060,68 @@ function renderOps(d){
   $('ops-content').innerHTML = html;
 }
 
+// ═══ ORG RENDER ══════════════════════════════════════════════
+function renderOrg(d) {
+  let html = '';
+  const teams = d.teams || [];
+
+  // Summary stats
+  const totalTasks = teams.reduce(function(a,t){return a+t.total_tasks},0);
+  const totalDone = teams.reduce(function(a,t){return a+t.completed},0);
+  const overallPct = totalTasks ? Math.round(totalDone/totalTasks*100) : 0;
+
+  html += '<div class="big-stats">';
+  html += '<div class="big-stat neutral"><div class="num">'+teams.length+'</div><div class="lbl">Teams</div></div>';
+  html += '<div class="big-stat neutral"><div class="num">'+totalTasks+'</div><div class="lbl">Total Tasks</div></div>';
+  html += '<div class="big-stat savings"><div class="num">'+totalDone+'</div><div class="lbl">Completed</div></div>';
+  html += '<div class="big-stat '+(overallPct>=50?'savings':'alert-yellow')+'"><div class="num">'+overallPct+'%</div><div class="lbl">Completion Rate</div></div>';
+  html += '</div>';
+
+  // Team cards
+  html += '<div class="grid">';
+  teams.forEach(function(team){
+    html += '<div class="card"><h2><span class="icon">👥</span> '+team.name.toUpperCase()+'</h2>';
+    if(team.error){
+      html += '<div class="empty">'+team.error+'</div>';
+    } else {
+      html += '<div class="stat-row"><span class="label">Total Tasks</span><span class="val">'+team.total_tasks+'</span></div>';
+      html += '<div class="stat-row"><span class="label">Completed</span><span class="val pos">'+team.completed+'</span></div>';
+      html += '<div class="stat-row"><span class="label">Completion</span><span class="val">'+team.completion_pct+'%</span></div>';
+      html += '<div class="progress-bar"><div class="fill" style="width:'+team.completion_pct+'%;background:'+(team.completion_pct>=50?'var(--green)':team.completion_pct>=25?'var(--yellow)':'var(--red)')+'"></div></div>';
+
+      if(team.open_tasks&&team.open_tasks.length){
+        html += '<div style="margin-top:10px"><div style="font-size:11px;color:var(--dim);margin-bottom:6px">OPEN TASKS:</div>';
+        team.open_tasks.forEach(function(t){
+          html += '<div style="font-size:12px;padding:3px 0;color:var(--text)">☐ '+t.text+'</div>';
+        });
+        html += '</div>';
+      }
+    }
+    html += '</div>';
+  });
+  html += '</div>';
+
+  // Tables from team files (e.g. Operations model tiering)
+  teams.forEach(function(team){
+    if(team.tables&&team.tables.length){
+      team.tables.forEach(function(tbl){
+        html += '<div class="card full" style="margin-top:14px"><h2><span class="icon">📊</span> '+team.name.toUpperCase()+' — DATA TABLE</h2>';
+        html += '<div style="overflow-x:auto"><table><tr>';
+        tbl.headers.forEach(function(h){html+='<th>'+h+'</th>'});
+        html += '</tr>';
+        tbl.rows.forEach(function(row){
+          html += '<tr>';
+          row.forEach(function(cell){html+='<td>'+cell+'</td>'});
+          html += '</tr>';
+        });
+        html += '</table></div></div>';
+      });
+    }
+  });
+
+  $('org-content').innerHTML = html;
+}
+
 // ═══ DATA LOADERS ════════════════════════════════════════════
 async function loadTrading(){
   try{const r=await fetch('/api/trading');const d=await r.json();renderTrading(d)}catch(e){console.error(e)}
@@ -626,11 +1129,32 @@ async function loadTrading(){
 async function loadOps(){
   try{const r=await fetch('/api/ops');const d=await r.json();renderOps(d)}catch(e){console.error(e)}
 }
+async function loadPortfolio(){
+  try{const r=await fetch('/api/portfolio');const d=await r.json();renderPortfolio(d)}catch(e){console.error(e)}
+}
+async function loadNews(){
+  try{
+    const [nr,sr]=await Promise.all([fetch('/api/news'),fetch('/api/signals')]);
+    const [nd,sd]=await Promise.all([nr.json(),sr.json()]);
+    renderNews(nd,sd);
+  }catch(e){console.error(e)}
+}
+async function loadOrg(){
+  try{const r=await fetch('/api/org');const d=await r.json();renderOrg(d)}catch(e){console.error(e)}
+}
 
 // Initial load
 loadTrading();
 setInterval(loadTrading,300000);
-setInterval(function(){if(document.getElementById('page-ops').classList.contains('active'))loadOps()},60000);
+setInterval(function(){
+  const active = document.querySelector('.page.active');
+  if(!active) return;
+  const id = active.id;
+  if(id==='page-ops') loadOps();
+  if(id==='page-portfolio') loadPortfolio();
+  if(id==='page-news') loadNews();
+  if(id==='page-org') loadOrg();
+},60000);
 </script>
 </body>
 </html>"""
