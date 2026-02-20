@@ -21,6 +21,8 @@ lock = threading.Lock()
 PORTFOLIO_FILE = Path("/tmp/kitebird-portfolio.json")
 TEAM_VIEWS_FILE = Path("/tmp/kitebird-team-views.json")
 TEAMS_DIR = Path(os.path.expanduser("~/ClawSystem/Obsidian/Agents/Teams"))
+SIGNALS_BOOK_FILE = Path("/tmp/kitebird-signals-book.json")
+SCREENSHOTS_DIR = Path(os.path.expanduser("~/ClawSystem/Control/Dux/tools/dashboard/screenshots"))
 
 # ═══════════════════════════════════════════════════════════════════
 # DATA FETCHERS — TRADING
@@ -403,6 +405,55 @@ def save_team_view(title, estimate):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# DATA — SIGNALS BOOK (Paper Trading for Quick Trades)
+# ═══════════════════════════════════════════════════════════════════
+
+def _default_signals_book():
+    return {
+        "starting_capital": 10000,
+        "trades": [],
+        "created": datetime.datetime.utcnow().strftime("%Y-%m-%d"),
+    }
+
+def load_signals_book():
+    if not SIGNALS_BOOK_FILE.exists():
+        data = _default_signals_book()
+        SIGNALS_BOOK_FILE.write_text(json.dumps(data, indent=2))
+        return data
+    try:
+        return json.loads(SIGNALS_BOOK_FILE.read_text())
+    except:
+        data = _default_signals_book()
+        SIGNALS_BOOK_FILE.write_text(json.dumps(data, indent=2))
+        return data
+
+def save_signals_book(data):
+    SIGNALS_BOOK_FILE.write_text(json.dumps(data, indent=2))
+
+def compute_signals_portfolio():
+    data = load_signals_book()
+    trades = data.get("trades", [])
+    open_trades = [t for t in trades if t.get("status") == "open"]
+    closed_trades = [t for t in trades if t.get("status") == "closed"]
+    realized_pnl = sum(t.get("pnl", 0) for t in closed_trades)
+    capital_in_use = sum(t.get("size", 0) * t.get("entry_price", 0) for t in open_trades)
+    wins = sum(1 for t in closed_trades if t.get("pnl", 0) > 0)
+    win_rate = round(wins / len(closed_trades) * 100, 1) if closed_trades else 0
+    return {
+        "starting_capital": data["starting_capital"],
+        "realized_pnl": round(realized_pnl, 2),
+        "capital_in_use": round(capital_in_use, 2),
+        "available_capital": round(data["starting_capital"] + realized_pnl - capital_in_use, 2),
+        "open_count": len(open_trades),
+        "closed_count": len(closed_trades),
+        "win_rate": win_rate,
+        "open_trades": open_trades,
+        "closed_trades": closed_trades[-50:],
+        "updated": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # DATA — ORG OVERVIEW
 # ═══════════════════════════════════════════════════════════════════
 
@@ -559,6 +610,71 @@ def api_signals_view():
         return jsonify({"error": "need title and estimate"}), 400
     save_team_view(body["title"], float(body["estimate"]))
     return jsonify({"ok": True})
+
+@app.route("/api/signals/portfolio")
+def api_signals_portfolio():
+    return jsonify(compute_signals_portfolio())
+
+@app.route("/api/signals/trade", methods=["POST"])
+def api_signals_trade():
+    body = request.get_json()
+    if not body or "market" not in body:
+        return jsonify({"error": "need at least 'market'"}), 400
+    data = load_signals_book()
+    trade = {
+        "id": len(data.get("trades", [])) + 1,
+        "timestamp": body.get("timestamp", datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M")),
+        "market": body["market"],
+        "direction": body.get("direction", "long"),
+        "size": float(body.get("size", 0)),
+        "entry_price": float(body.get("entry_price", 0)),
+        "rationale": body.get("rationale", ""),
+        "screenshot_path": body.get("screenshot_path", ""),
+        "exit_timestamp": None,
+        "exit_price": None,
+        "exit_screenshot_path": None,
+        "pnl": None,
+        "status": "open",
+    }
+    data.setdefault("trades", []).append(trade)
+    save_signals_book(data)
+    return jsonify({"ok": True, "trade_id": trade["id"]})
+
+@app.route("/api/signals/trade/exit", methods=["POST"])
+def api_signals_trade_exit():
+    body = request.get_json()
+    if not body or "trade_id" not in body or "exit_price" not in body:
+        return jsonify({"error": "need trade_id and exit_price"}), 400
+    data = load_signals_book()
+    trade_id = int(body["trade_id"])
+    for t in data.get("trades", []):
+        if t.get("id") == trade_id and t.get("status") == "open":
+            t["exit_timestamp"] = body.get("exit_timestamp", datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M"))
+            t["exit_price"] = float(body["exit_price"])
+            t["exit_screenshot_path"] = body.get("screenshot_path", "")
+            multiplier = 1 if t["direction"] == "long" else -1
+            t["pnl"] = round((t["exit_price"] - t["entry_price"]) * t["size"] * multiplier, 2)
+            t["status"] = "closed"
+            save_signals_book(data)
+            return jsonify({"ok": True, "pnl": t["pnl"]})
+    return jsonify({"error": "trade not found or already closed"}), 404
+
+@app.route("/api/signals/screenshot", methods=["POST"])
+def api_signals_screenshot():
+    import base64 as b64mod
+    body = request.get_json()
+    if not body or "image" not in body:
+        return jsonify({"error": "need base64 'image'"}), 400
+    SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    fname = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S") + ".png"
+    fpath = SCREENSHOTS_DIR / fname
+    fpath.write_bytes(b64mod.b64decode(body["image"]))
+    return jsonify({"ok": True, "filename": fname, "path": str(fpath)})
+
+@app.route("/api/signals/screenshot/<filename>")
+def api_signals_screenshot_serve(filename):
+    from flask import send_from_directory
+    return send_from_directory(str(SCREENSHOTS_DIR), filename)
 
 @app.route("/api/org")
 def api_org():
@@ -929,8 +1045,50 @@ function renderPortfolio(d) {
 }
 
 // ═══ NEWS & SIGNALS RENDER ═══════════════════════════════════
-function renderNews(newsData, sigData) {
+function renderNews(newsData, sigData, sbData) {
   let html = '';
+
+  // ─── Signals Book Summary ───
+  if(sbData){
+    html += '<div class="big-stats">';
+    html += '<div class="big-stat neutral"><div class="num">$'+sbData.starting_capital.toLocaleString()+'</div><div class="lbl">Signals Capital</div></div>';
+    html += '<div class="big-stat '+(sbData.realized_pnl>=0?'savings':'alert-red')+'"><div class="num">'+(sbData.realized_pnl>=0?'+$':'-$')+Math.abs(sbData.realized_pnl).toFixed(2)+'</div><div class="lbl">Realized P&L</div></div>';
+    html += '<div class="big-stat neutral"><div class="num">'+sbData.win_rate+'%</div><div class="lbl">Win Rate</div></div>';
+    html += '<div class="big-stat neutral"><div class="num">'+sbData.open_count+'</div><div class="lbl">Open Positions</div></div>';
+    html += '</div>';
+
+    // Open positions table
+    if(sbData.open_trades&&sbData.open_trades.length){
+      html += '<div class="card full" style="margin-bottom:14px"><h2><span class="icon">📗</span> SIGNALS BOOK — OPEN POSITIONS</h2>';
+      html += '<div style="overflow-x:auto"><table>';
+      html += '<tr><th>ID</th><th>Market</th><th>Dir</th><th>Size</th><th>Entry</th><th>Rationale</th><th>📷</th></tr>';
+      sbData.open_trades.forEach(function(t){
+        const scr = t.screenshot_path ? '<a href="/api/signals/screenshot/'+t.screenshot_path.split('/').pop()+'" target="_blank">📷</a>' : '';
+        html += '<tr><td>'+t.id+'</td><td>'+t.market+'</td><td><span class="badge">'+(t.direction||'long').toUpperCase()+'</span></td>';
+        html += '<td>'+t.size+'</td><td>$'+parseFloat(t.entry_price).toFixed(2)+'</td>';
+        html += '<td style="color:var(--dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+t.rationale+'</td>';
+        html += '<td>'+scr+'</td></tr>';
+      });
+      html += '</table></div></div>';
+    }
+
+    // Closed trades
+    if(sbData.closed_trades&&sbData.closed_trades.length){
+      html += '<div class="card full" style="margin-bottom:14px"><h2><span class="icon">📕</span> SIGNALS BOOK — RECENT CLOSED</h2>';
+      html += '<div style="overflow-x:auto"><table>';
+      html += '<tr><th>ID</th><th>Market</th><th>Dir</th><th>Entry</th><th>Exit</th><th>P&L</th><th>📷</th></tr>';
+      sbData.closed_trades.slice().reverse().forEach(function(t){
+        const scrEntry = t.screenshot_path ? '<a href="/api/signals/screenshot/'+t.screenshot_path.split('/').pop()+'" target="_blank">📷</a>' : '';
+        const scrExit = t.exit_screenshot_path ? '<a href="/api/signals/screenshot/'+t.exit_screenshot_path.split('/').pop()+'" target="_blank">📷</a>' : '';
+        const scr = [scrEntry, scrExit].filter(Boolean).join(' ');
+        html += '<tr><td>'+t.id+'</td><td>'+t.market+'</td><td><span class="badge">'+(t.direction||'long').toUpperCase()+'</span></td>';
+        html += '<td>$'+parseFloat(t.entry_price).toFixed(2)+'</td><td>$'+parseFloat(t.exit_price).toFixed(2)+'</td>';
+        html += '<td class="'+pnlClass(t.pnl)+'">'+pnlSign(t.pnl)+'</td>';
+        html += '<td>'+scr+'</td></tr>';
+      });
+      html += '</table></div></div>';
+    }
+  }
 
   // Dislocations first
   const dislocations = (sigData.markets||[]).filter(function(s){return s.dislocation});
@@ -1134,9 +1292,9 @@ async function loadPortfolio(){
 }
 async function loadNews(){
   try{
-    const [nr,sr]=await Promise.all([fetch('/api/news'),fetch('/api/signals')]);
-    const [nd,sd]=await Promise.all([nr.json(),sr.json()]);
-    renderNews(nd,sd);
+    const [nr,sr,sbr]=await Promise.all([fetch('/api/news'),fetch('/api/signals'),fetch('/api/signals/portfolio')]);
+    const [nd,sd,sbd]=await Promise.all([nr.json(),sr.json(),sbr.json()]);
+    renderNews(nd,sd,sbd);
   }catch(e){console.error(e)}
 }
 async function loadOrg(){
