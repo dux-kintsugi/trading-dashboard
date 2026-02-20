@@ -1,0 +1,9 @@
+[project]
+name = "quantlab-dashboard"
+version = "1.0.0"
+description = "QuantLab Trading Dashboard — VIX, Funding Rates, Arb Scanner"
+requires-python = ">=3.10"
+dependencies = ["flask>=3.0", "requests>=2.31", "yfinance>=0.2.36"]
+
+[project.scripts]
+start = "main:app"
