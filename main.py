@@ -23,6 +23,7 @@ TEAM_VIEWS_FILE = Path("/tmp/kitebird-team-views.json")
 TEAMS_DIR = Path(os.path.expanduser("~/ClawSystem/Obsidian/Agents/Teams"))
 SIGNALS_BOOK_FILE = Path("/tmp/kitebird-signals-book.json")
 ETF_PORTFOLIO_FILE = Path("/tmp/kitebird-etf-portfolio.json")
+CRYPTO_PORTFOLIO_FILE = Path("/tmp/kitebird-crypto-portfolio.json")
 SCREENSHOTS_DIR = Path(os.path.expanduser("~/ClawSystem/Control/Dux/tools/dashboard/screenshots"))
 
 # ═══════════════════════════════════════════════════════════════════
@@ -365,6 +366,61 @@ def compute_etf_portfolio():
     total_pnl = total_value - data["starting_capital"]
     return {
         "portfolio_name": data.get("portfolio_name", "ETF Mirror Portfolio"),
+        "description": data.get("description", ""),
+        "starting_capital": data["starting_capital"],
+        "total_value": round(total_value, 2),
+        "total_pnl": round(total_pnl, 2),
+        "total_pnl_pct": round(total_pnl / data["starting_capital"] * 100, 2) if data["starting_capital"] else 0,
+        "strategies": data.get("strategies", []),
+        "positions": data.get("positions", []),
+        "trades": data.get("trades", [])[-50:],
+        "updated": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
+
+# ═══════════════════════════════════════════════════════════════════
+# DATA — CRYPTO PORTFOLIO
+# ═══════════════════════════════════════════════════════════════════
+
+def _default_crypto_portfolio():
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    return {
+        "starting_capital": 10000,
+        "portfolio_name": "Crypto Portfolio",
+        "description": "Dedicated crypto trading — funding arb, momentum, delta-neutral.",
+        "strategies": [
+            {"name": "Funding Arb", "allocation_pct": 50, "allocated": 5000},
+            {"name": "Momentum/Swing", "allocation_pct": 30, "allocated": 3000},
+            {"name": "Delta Neutral", "allocation_pct": 20, "allocated": 2000},
+        ],
+        "positions": [],
+        "trades": [],
+        "created": now,
+    }
+
+def load_crypto_portfolio():
+    if not CRYPTO_PORTFOLIO_FILE.exists():
+        data = _default_crypto_portfolio()
+        CRYPTO_PORTFOLIO_FILE.write_text(json.dumps(data, indent=2))
+        return data
+    try:
+        return json.loads(CRYPTO_PORTFOLIO_FILE.read_text())
+    except:
+        data = _default_crypto_portfolio()
+        CRYPTO_PORTFOLIO_FILE.write_text(json.dumps(data, indent=2))
+        return data
+
+def save_crypto_portfolio(data):
+    CRYPTO_PORTFOLIO_FILE.write_text(json.dumps(data, indent=2))
+
+def compute_crypto_portfolio():
+    data = load_crypto_portfolio()
+    total_value = sum(p.get("current_value", 0) for p in data.get("positions", []))
+    if not total_value and data.get("positions"):
+        total_value = data["starting_capital"]
+    total_pnl = total_value - data["starting_capital"]
+    open_pos = [p for p in data.get("positions", []) if p.get("status") == "open"]
+    return {
+        "portfolio_name": data.get("portfolio_name", "Crypto Portfolio"),
         "description": data.get("description", ""),
         "starting_capital": data["starting_capital"],
         "total_value": round(total_value, 2),
@@ -731,6 +787,27 @@ def api_signals_screenshot_serve(filename):
     from flask import send_from_directory
     return send_from_directory(str(SCREENSHOTS_DIR), filename)
 
+@app.route("/api/crypto")
+def api_crypto():
+    return jsonify(compute_crypto_portfolio())
+
+@app.route("/api/crypto/trade", methods=["POST"])
+def api_crypto_trade():
+    trade = request.get_json()
+    if not trade:
+        return jsonify({"error": "no data"}), 400
+    data = load_crypto_portfolio()
+    trade["timestamp"] = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    data.setdefault("trades", []).append(trade)
+    if "position_id" in trade and "new_value" in trade:
+        for p in data.get("positions", []):
+            if p.get("id") == trade["position_id"]:
+                p["current_value"] = float(trade["new_value"])
+                p["pnl"] = round(p["current_value"] - p.get("cost_basis", 0), 2)
+                p["status"] = trade.get("status", p.get("status", "open"))
+    save_crypto_portfolio(data)
+    return jsonify({"ok": True})
+
 @app.route("/api/etf")
 def api_etf():
     return jsonify(compute_etf_portfolio())
@@ -751,6 +828,126 @@ def api_etf_trade():
                 p["status"] = trade.get("status", p.get("status", "open"))
     save_etf_portfolio(data)
     return jsonify({"ok": True})
+
+@app.route("/api/journal")
+def api_journal():
+    result = {"open_positions": [], "closed_trades": [],
+              "updated": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")}
+    # ── Main portfolio ──────────────────────────────────────────
+    try:
+        main_data = load_portfolio()
+        for i, p in enumerate(main_data.get("positions", [])):
+            pos = dict(p)
+            pos["portfolio"] = "Main"
+            pos["trade_id"] = pos.get("id", f"pos_{i}")
+            pos["strategy"] = pos.get("strategy", "")
+            pos["description"] = pos.get("description", pos.get("strategy", ""))
+            pos["ticker"] = pos.get("ticker", "")
+            pos["entry_date"] = pos.get("entry_date", "")
+            pos["status"] = pos.get("status", "open")
+            if pos["status"] in ("open", "monitoring"):
+                result["open_positions"].append(pos)
+        for i, t in enumerate(main_data.get("trades", [])):
+            trade = dict(t)
+            trade["portfolio"] = "Main"
+            trade["trade_id"] = str(t.get("id", i))
+            trade["strategy"] = t.get("strategy", "")
+            trade["description"] = t.get("description", t.get("strategy", ""))
+            trade["ticker"] = t.get("ticker", "")
+            trade["entry_date"] = t.get("entry_date", t.get("timestamp", ""))
+            trade["exit_date"] = t.get("exit_date", t.get("exit_timestamp", ""))
+            if t.get("status") == "closed":
+                result["closed_trades"].append(trade)
+    except Exception as e:
+        result["main_error"] = str(e)
+    # ── Signals book ────────────────────────────────────────────
+    try:
+        sig_data = load_signals_book()
+        for t in sig_data.get("trades", []):
+            trade = dict(t)
+            trade["portfolio"] = "Signals"
+            trade["trade_id"] = str(t.get("id", ""))
+            trade["strategy"] = t.get("direction", "").upper() + " " + t.get("market", "")
+            trade["description"] = t.get("market", "")
+            trade["ticker"] = t.get("market", "")
+            trade["entry_date"] = t.get("timestamp", "")
+            trade["exit_date"] = t.get("exit_timestamp", "")
+            trade["notes"] = t.get("rationale", "")
+            trade["exit_notes"] = t.get("exit_notes", "")
+            trade["screenshot_path"] = t.get("screenshot_path", "")
+            trade["exit_screenshot_path"] = t.get("exit_screenshot_path", "")
+            if t.get("status") == "open":
+                ep = float(t.get("entry_price", 0))
+                sz = float(t.get("size", 1))
+                trade["entry_price"] = ep
+                trade["current_value"] = round(ep * sz, 2)
+                trade["pnl"] = 0
+                result["open_positions"].append(trade)
+            elif t.get("status") == "closed":
+                result["closed_trades"].append(trade)
+    except Exception as e:
+        result["signals_error"] = str(e)
+    # ── ETF portfolio ────────────────────────────────────────────
+    try:
+        etf_data = load_etf_portfolio()
+        for i, p in enumerate(etf_data.get("positions", [])):
+            pos = dict(p)
+            pos["portfolio"] = "ETF"
+            pos["trade_id"] = str(p.get("id", i))
+            pos["strategy"] = pos.get("strategy", "")
+            pos["description"] = pos.get("description", "")
+            pos["ticker"] = pos.get("ticker", "")
+            pos["entry_date"] = pos.get("entry_date", "")
+            pos["status"] = pos.get("status", "open")
+            if pos["status"] in ("open", "monitoring"):
+                result["open_positions"].append(pos)
+        for i, t in enumerate(etf_data.get("trades", [])):
+            trade = dict(t)
+            trade["portfolio"] = "ETF"
+            trade["trade_id"] = str(t.get("id", i))
+            trade["strategy"] = t.get("strategy", "")
+            trade["description"] = t.get("description", "")
+            trade["ticker"] = t.get("ticker", "")
+            trade["entry_date"] = t.get("entry_date", t.get("timestamp", ""))
+            trade["exit_date"] = t.get("exit_date", t.get("exit_timestamp", ""))
+            if t.get("status") == "closed":
+                result["closed_trades"].append(trade)
+    except Exception as e:
+        result["etf_error"] = str(e)
+    # Sort closed trades newest first
+    def _sort_key(t):
+        return t.get("exit_date") or t.get("exit_timestamp") or t.get("timestamp") or t.get("entry_date") or ""
+    result["closed_trades"].sort(key=_sort_key, reverse=True)
+    return jsonify(result)
+
+
+@app.route("/api/journal/trade/<portfolio>/<trade_id>")
+def api_journal_trade(portfolio, trade_id):
+    try:
+        if portfolio == "main":
+            data = load_portfolio()
+            for i, p in enumerate(data.get("positions", [])):
+                if str(p.get("id", f"pos_{i}")) == trade_id or f"pos_{i}" == trade_id:
+                    return jsonify({"portfolio": "Main", "trade_id": trade_id, **p})
+            for i, t in enumerate(data.get("trades", [])):
+                if str(t.get("id", i)) == trade_id:
+                    return jsonify({"portfolio": "Main", "trade_id": trade_id, **t})
+        elif portfolio == "signals":
+            data = load_signals_book()
+            for t in data.get("trades", []):
+                if str(t.get("id", "")) == trade_id:
+                    return jsonify({"portfolio": "Signals", "trade_id": trade_id, **t})
+        elif portfolio == "etf":
+            data = load_etf_portfolio()
+            for i, p in enumerate(data.get("positions", [])):
+                if str(p.get("id", i)) == trade_id:
+                    return jsonify({"portfolio": "ETF", "trade_id": trade_id, **p})
+            for i, t in enumerate(data.get("trades", [])):
+                if str(t.get("id", i)) == trade_id:
+                    return jsonify({"portfolio": "ETF", "trade_id": trade_id, **t})
+        return jsonify({"error": "trade not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/org")
 def api_org():
@@ -880,6 +1077,37 @@ tr:hover{background:#ffffff06}
 /* ─── FOOTER ─── */
 .footer{text-align:center;padding:16px;color:var(--dim);font-size:11px;border-top:1px solid var(--border);margin-top:16px}
 
+/* ─── TRADE JOURNAL ─── */
+.jrnl-summary{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.jrnl-stat{background:#0d1117;border:1px solid var(--border);border-radius:10px;padding:12px 16px;flex:1;min-width:140px;text-align:center}
+.jrnl-stat .num{font-size:24px;font-weight:700;line-height:1.2}
+.jrnl-stat .lbl{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+.jrnl-section{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:14px;overflow:hidden}
+.jrnl-section h2{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:12px;display:flex;align-items:center;gap:6px;font-weight:600}
+.jrnl-row{cursor:pointer;transition:background .12s}
+.jrnl-row:hover{background:#06b6d412 !important}
+.port-badge-main{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;background:#3b82f620;color:var(--blue);font-weight:600}
+.port-badge-signals{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;background:#a855f720;color:var(--purple);font-weight:600}
+.port-badge-etf{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;background:#22c55e20;color:var(--green);font-weight:600}
+.status-open{color:var(--green);font-weight:600}
+.status-monitoring{color:var(--yellow);font-weight:600}
+.status-closed{color:var(--dim)}
+
+/* ─── TRADE DETAIL MODAL ─── */
+.modal-field{display:flex;gap:8px;padding:8px 0;border-bottom:1px solid #1e293b;font-size:13px}
+.modal-field .mf-label{color:var(--dim);min-width:140px;flex-shrink:0;font-size:12px}
+.modal-field .mf-val{color:var(--text);word-break:break-word}
+.modal-section-title{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1.5px;font-weight:600;margin:14px 0 6px;padding-bottom:4px;border-bottom:1px solid #1e293b}
+.modal-timeline{display:flex;align-items:center;gap:0;margin:12px 0;padding:12px;background:#0d1117;border-radius:8px;border:1px solid #1e293b;font-size:12px;flex-wrap:wrap;gap:8px}
+.modal-timeline .tl-node{text-align:center;padding:6px 12px;background:#1e293b;border-radius:6px}
+.modal-timeline .tl-node .tl-date{font-weight:600;color:var(--text)}
+.modal-timeline .tl-node .tl-label{color:var(--dim);font-size:11px;margin-top:2px}
+.modal-timeline .tl-arrow{color:var(--dim);font-size:18px;flex-shrink:0}
+.modal-screenshot{margin-top:8px;border-radius:8px;max-width:100%;border:1px solid #1e293b}
+.modal-pnl-box{background:#0d1117;border:1px solid #1e293b;border-radius:8px;padding:12px;margin-top:8px}
+.modal-pnl-box .pnl-row{display:flex;justify-content:space-between;padding:4px 0;font-size:13px}
+.modal-pnl-box .pnl-row.total{border-top:1px solid #1e293b;margin-top:6px;padding-top:8px;font-weight:700;font-size:15px}
+
 /* ─── RESPONSIVE ─── */
 @media(max-width:768px){
   .grid{grid-template-columns:1fr}
@@ -895,6 +1123,11 @@ tr:hover{background:#ffffff06}
   .big-stat .num{font-size:22px}
   .hide-mobile{display:none}
   .pie{width:90px;height:90px}
+  /* modal fullscreen on mobile */
+  #trade-modal{width:100% !important;margin:0 !important;border-radius:0 !important;max-height:100dvh !important;min-height:100dvh !important;border:none !important}
+  #trade-modal-overlay{padding:0}
+  .jrnl-summary{gap:8px}
+  .jrnl-stat{min-width:100px;padding:10px}
 }
 @media(max-width:420px){
   .big-stats{grid-template-columns:1fr 1fr}
@@ -909,6 +1142,8 @@ tr:hover{background:#ffffff06}
   <div class="logo">KITEBIRD <span>CAPITAL</span></div>
   <button class="nav-btn active" onclick="showPage('trading',this)">📊 Trading</button>
   <button class="nav-btn" onclick="showPage('portfolio',this)">📈 Portfolio</button>
+  <button class="nav-btn" onclick="showPage('crypto',this)">🪙 Crypto</button>
+  <button class="nav-btn" onclick="showPage('journal',this)">📋 Trade Journal</button>
   <button class="nav-btn" onclick="showPage('news',this)">📰 News & Signals</button>
   <button class="nav-btn" onclick="showPage('etf',this)">🏦 ETF Mirror</button>
   <button class="nav-btn" onclick="showPage('ops',this)">⚙️ Ops & Costs</button>
@@ -942,9 +1177,29 @@ tr:hover{background:#ffffff06}
 </div>
 
 <!-- ═══ ETF MIRROR PAGE ═══ -->
+<!-- ═══ CRYPTO PAGE ═══ -->
+<div class="page" id="page-crypto">
+  <div id="crypto-content"><div class="loading">Loading crypto portfolio…</div></div>
+  <div class="footer">Crypto Portfolio • $10K dedicated capital • Funding arb, momentum, delta-neutral</div>
+</div>
+
 <div class="page" id="page-etf">
   <div id="etf-content"><div class="loading">Loading ETF mirror portfolio…</div></div>
   <div class="footer">ETF Mirror Portfolio • Mirrors main trades via ETFs/options • $10K paper capital</div>
+</div>
+
+<!-- ═══ TRADE JOURNAL PAGE ═══ -->
+<div class="page" id="page-journal">
+  <div id="journal-content"><div class="loading">Loading trade journal…</div></div>
+  <div class="footer">Unified trade journal • All portfolios: Main · Signals · ETF • Click any row for full detail</div>
+</div>
+
+<!-- ═══ TRADE DETAIL MODAL ═══ -->
+<div id="trade-modal-overlay" onclick="closeTradeModal(event)" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.75);backdrop-filter:blur(4px);overflow:auto">
+  <div id="trade-modal" onclick="event.stopPropagation()" style="position:relative;max-width:680px;width:calc(100% - 32px);margin:40px auto;background:#111827;border:1px solid #2d3a52;border-radius:14px;box-shadow:0 0 40px #06b6d430;padding:24px;max-height:90vh;overflow-y:auto;transition:transform .25s ease">
+    <button onclick="closeTradeModal()" style="position:absolute;top:14px;right:14px;background:none;border:none;color:#64748b;font-size:22px;cursor:pointer;line-height:1;padding:4px 8px;border-radius:6px;transition:color .15s" onmouseover="this.style.color='#e2e8f0'" onmouseout="this.style.color='#64748b'">✕</button>
+    <div id="trade-modal-body"><div class="loading">Loading…</div></div>
+  </div>
 </div>
 
 <!-- ═══ OPS PAGE ═══ -->
@@ -969,7 +1224,9 @@ function showPage(name, btn) {
   if (name === 'ops') loadOps();
   if (name === 'trading') loadTrading();
   if (name === 'portfolio') loadPortfolio();
+  if (name === 'journal') loadJournal();
   if (name === 'news') loadNews();
+  if (name === 'crypto') loadCrypto();
   if (name === 'etf') loadETF();
   if (name === 'org') loadOrg();
 }
@@ -1442,6 +1699,299 @@ function renderETF(d) {
   el.innerHTML = h;
 }
 
+// ═══ JOURNAL RENDER ══════════════════════════════════════════
+function portBadge(portfolio) {
+  const p = (portfolio || '').toLowerCase();
+  if (p === 'main') return '<span class="port-badge-main">Main</span>';
+  if (p === 'signals') return '<span class="port-badge-signals">Signals</span>';
+  if (p === 'etf') return '<span class="port-badge-etf">ETF</span>';
+  return '<span class="badge">'+portfolio+'</span>';
+}
+
+function jrnlStatusBadge(status) {
+  const s = (status || 'open').toLowerCase();
+  if (s === 'monitoring') return '<span class="status-monitoring">👁 Monitoring</span>';
+  if (s === 'closed') return '<span class="status-closed">Closed</span>';
+  return '<span class="status-open">● Open</span>';
+}
+
+function renderJournal(d) {
+  const open = d.open_positions || [];
+  const closed = d.closed_trades || [];
+
+  // ── compute summary stats ──────────────────────────────────
+  let totalPnl = 0, capitalDeployed = 0;
+  open.forEach(function(p) {
+    const pnl = parseFloat(p.pnl) || 0;
+    const cv = parseFloat(p.current_value) || 0;
+    totalPnl += pnl;
+    capitalDeployed += cv;
+  });
+  const closedWins = closed.filter(function(t){ return (parseFloat(t.pnl)||0) > 0; }).length;
+  const realizedPnl = closed.reduce(function(a,t){ return a + (parseFloat(t.pnl)||0); }, 0);
+  const winRate = closed.length ? Math.round(closedWins/closed.length*100) : 0;
+  const winAmounts = closed.filter(function(t){ return (parseFloat(t.pnl)||0)>0; }).map(function(t){ return parseFloat(t.pnl)||0; });
+  const lossAmounts = closed.filter(function(t){ return (parseFloat(t.pnl)||0)<0; }).map(function(t){ return parseFloat(t.pnl)||0; });
+  const avgWin = winAmounts.length ? winAmounts.reduce(function(a,v){return a+v},0)/winAmounts.length : 0;
+  const avgLoss = lossAmounts.length ? lossAmounts.reduce(function(a,v){return a+v},0)/lossAmounts.length : 0;
+
+  let html = '';
+
+  // ── Open Positions summary bar ──────────────────────────────
+  html += '<div class="jrnl-summary">';
+  html += '<div class="jrnl-stat"><div class="num">'+open.length+'</div><div class="lbl">Open Positions</div></div>';
+  html += '<div class="jrnl-stat"><div class="num '+(totalPnl>=0?'pos':'neg')+'">$'+(totalPnl>=0?'+':'')+totalPnl.toFixed(2)+'</div><div class="lbl">Unrealized P&L</div></div>';
+  html += '<div class="jrnl-stat"><div class="num">$'+capitalDeployed.toFixed(0)+'</div><div class="lbl">Capital Deployed</div></div>';
+  html += '</div>';
+
+  // ── Open Positions table ────────────────────────────────────
+  html += '<div class="jrnl-section"><h2><span class="icon">📗</span> Current Positions</h2>';
+  if (open.length) {
+    html += '<div style="overflow-x:auto"><table>';
+    html += '<tr><th>Portfolio</th><th>Strategy</th><th>Description</th><th class="hide-mobile">Ticker</th><th class="hide-mobile">Entry Date</th><th>Entry Price</th><th>Value</th><th>P&L</th><th>P&L%</th><th>Status</th></tr>';
+    open.forEach(function(p, idx) {
+      const pnl = parseFloat(p.pnl) || 0;
+      const ep = parseFloat(p.entry_price) || 0;
+      const cv = parseFloat(p.current_value) || 0;
+      const pnlPct = ep > 0 ? ((pnl / ep) * 100).toFixed(1) : '—';
+      const rowCls = (p.status||'open').toLowerCase() === 'monitoring' ? 'background:#eab30808' : pnl > 0 ? 'background:#22c55e06' : pnl < 0 ? 'background:#ef444406' : '';
+      const portfolio = (p.portfolio||'').toLowerCase();
+      html += '<tr class="jrnl-row" style="'+rowCls+'" onclick="openTradeModal(\''+portfolio+'\',\''+String(p.trade_id||idx)+'\',this)">';
+      html += '<td>'+portBadge(p.portfolio)+'</td>';
+      html += '<td>'+(p.strategy||'—')+'</td>';
+      html += '<td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px">'+(p.description||'—')+'</td>';
+      html += '<td class="hide-mobile"><strong>'+(p.ticker||'—')+'</strong></td>';
+      html += '<td class="hide-mobile" style="color:var(--dim);font-size:12px">'+(p.entry_date||'—')+'</td>';
+      html += '<td>'+(ep?'$'+ep.toFixed(2):'—')+'</td>';
+      html += '<td>'+(cv?'$'+cv.toFixed(2):'—')+'</td>';
+      html += '<td class="'+(pnl>=0?'pos':'neg')+'">'+pnlSign(pnl)+'</td>';
+      html += '<td class="'+(pnl>=0?'pos':'neg')+'">'+(pnlPct!=='—'?pnlPct+'%':'—')+'</td>';
+      html += '<td>'+jrnlStatusBadge(p.status)+'</td>';
+      html += '</tr>';
+    });
+    html += '</table></div>';
+  } else {
+    html += '<div class="empty">No open positions across any portfolio</div>';
+  }
+  html += '</div>';
+
+  // ── Closed Trades summary bar ───────────────────────────────
+  html += '<div class="jrnl-summary" style="margin-top:0">';
+  html += '<div class="jrnl-stat"><div class="num">'+closed.length+'</div><div class="lbl">Closed Trades</div></div>';
+  html += '<div class="jrnl-stat"><div class="num '+(realizedPnl>=0?'pos':'neg')+'">$'+(realizedPnl>=0?'+':'')+realizedPnl.toFixed(2)+'</div><div class="lbl">Realized P&L</div></div>';
+  html += '<div class="jrnl-stat"><div class="num">'+(winRate)+'%</div><div class="lbl">Win Rate</div></div>';
+  html += '<div class="jrnl-stat"><div class="num pos">$'+avgWin.toFixed(2)+'</div><div class="lbl">Avg Win</div></div>';
+  html += '<div class="jrnl-stat"><div class="num neg">$'+Math.abs(avgLoss).toFixed(2)+'</div><div class="lbl">Avg Loss</div></div>';
+  html += '</div>';
+
+  // ── Closed Trades table ─────────────────────────────────────
+  html += '<div class="jrnl-section"><h2><span class="icon">📕</span> Trade History (Closed)</h2>';
+  if (closed.length) {
+    html += '<div style="overflow-x:auto"><table>';
+    html += '<tr><th>Portfolio</th><th>Strategy</th><th class="hide-mobile">Description</th><th>Entry</th><th class="hide-mobile">Exit Date</th><th>Entry $</th><th>Exit $</th><th>P&L</th><th>P&L%</th><th class="hide-mobile">Duration</th></tr>';
+    closed.forEach(function(t, idx) {
+      const pnl = parseFloat(t.pnl) || 0;
+      const ep = parseFloat(t.entry_price) || 0;
+      const xp = parseFloat(t.exit_price) || 0;
+      const pnlPct = ep > 0 ? ((pnl / ep) * 100).toFixed(1) : '—';
+      const entDate = t.entry_date || t.timestamp || '';
+      const extDate = t.exit_date || t.exit_timestamp || '';
+      let duration = '—';
+      if (entDate && extDate) {
+        try {
+          const ms = new Date(extDate) - new Date(entDate);
+          if (!isNaN(ms) && ms >= 0) {
+            const days = Math.floor(ms / 86400000);
+            duration = days > 0 ? days+'d' : Math.floor(ms/3600000)+'h';
+          }
+        } catch(e){}
+      }
+      const portfolio = (t.portfolio||'').toLowerCase();
+      html += '<tr class="jrnl-row" onclick="openTradeModal(\''+portfolio+'\',\''+String(t.trade_id||idx)+'\',this)">';
+      html += '<td>'+portBadge(t.portfolio)+'</td>';
+      html += '<td>'+(t.strategy||'—')+'</td>';
+      html += '<td class="hide-mobile" style="font-size:12px;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(t.description||'—')+'</td>';
+      html += '<td style="color:var(--dim);font-size:12px">'+(entDate||'—').substring(0,10)+'</td>';
+      html += '<td class="hide-mobile" style="color:var(--dim);font-size:12px">'+(extDate||'—').substring(0,10)+'</td>';
+      html += '<td>'+(ep?'$'+ep.toFixed(2):'—')+'</td>';
+      html += '<td>'+(xp?'$'+xp.toFixed(2):'—')+'</td>';
+      html += '<td class="'+(pnl>=0?'pos':'neg')+'">'+pnlSign(pnl)+'</td>';
+      html += '<td class="'+(pnl>=0?'pos':'neg')+'">'+(pnlPct!=='—'?pnlPct+'%':'—')+'</td>';
+      html += '<td class="hide-mobile" style="color:var(--dim)">'+duration+'</td>';
+      html += '</tr>';
+    });
+    html += '</table></div>';
+  } else {
+    html += '<div class="empty">No closed trades yet</div>';
+  }
+  html += '</div>';
+
+  if (d.updated) {
+    html += '<div style="text-align:right;color:var(--dim);font-size:11px;margin-top:-8px">Updated: '+d.updated+'</div>';
+  }
+  $('journal-content').innerHTML = html;
+}
+
+async function loadJournal() {
+  try {
+    const r = await fetch('/api/journal');
+    const d = await r.json();
+    renderJournal(d);
+  } catch(e) {
+    $('journal-content').innerHTML = '<div class="empty">Error loading journal: '+e+'</div>';
+  }
+}
+
+// ─── Trade Detail Modal ──────────────────────────────────────
+async function openTradeModal(portfolio, tradeId, row) {
+  const overlay = $('trade-modal-overlay');
+  const body = $('trade-modal-body');
+  overlay.style.display = 'block';
+  body.innerHTML = '<div class="loading">Loading trade detail…</div>';
+  try {
+    const r = await fetch('/api/journal/trade/'+portfolio+'/'+tradeId);
+    const t = await r.json();
+    if (t.error) { body.innerHTML = '<div class="empty">'+t.error+'</div>'; return; }
+    renderTradeModal(t);
+  } catch(e) {
+    body.innerHTML = '<div class="empty">Error: '+e+'</div>';
+  }
+}
+
+function renderTradeModal(t) {
+  const pnl = parseFloat(t.pnl) || 0;
+  const ep = parseFloat(t.entry_price) || 0;
+  const xp = parseFloat(t.exit_price) || 0;
+  const cv = parseFloat(t.current_value) || 0;
+  const sz = parseFloat(t.size) || 1;
+  const entDate = t.entry_date || t.timestamp || '';
+  const extDate = t.exit_date || t.exit_timestamp || '';
+  let duration = null;
+  if (entDate && extDate) {
+    try {
+      const ms = new Date(extDate) - new Date(entDate);
+      if (!isNaN(ms) && ms >= 0) {
+        const d = Math.floor(ms/86400000), h = Math.floor((ms%86400000)/3600000);
+        duration = (d>0?d+'d ':'')+h+'h';
+      }
+    } catch(e){}
+  }
+  const isClosed = (t.status||'').toLowerCase() === 'closed';
+  const portfolio = (t.portfolio||'');
+
+  let html = '';
+  // Header
+  html += '<div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:16px;padding-right:30px">';
+  html += portBadge(portfolio);
+  html += '<div><div style="font-size:16px;font-weight:700;color:var(--text)">'+(t.description||t.market||t.strategy||'Trade Detail')+'</div>';
+  html += '<div style="font-size:12px;color:var(--dim);margin-top:2px">'+(t.strategy||t.market||'')+'&nbsp;'+(t.ticker?'• <strong>'+t.ticker+'</strong>':'')+'</div></div>';
+  if (isClosed) {
+    html += '<div style="margin-left:auto;font-size:14px;font-weight:700" class="'+(pnl>=0?'pos':'neg')+'">'+pnlSign(pnl)+'</div>';
+  }
+  html += '</div>';
+
+  // Timeline
+  html += '<div class="modal-timeline">';
+  html += '<div class="tl-node"><div class="tl-date">'+(entDate||'?').substring(0,16)+'</div><div class="tl-label">Entry</div></div>';
+  if (isClosed && extDate) {
+    html += '<div class="tl-arrow">→</div>';
+    html += '<div class="tl-node"><div class="tl-date">'+extDate.substring(0,16)+'</div><div class="tl-label">Exit</div></div>';
+    if (duration) {
+      html += '<div class="tl-arrow">⏱</div>';
+      html += '<div class="tl-node"><div class="tl-date">'+duration+'</div><div class="tl-label">Duration</div></div>';
+    }
+  } else {
+    const now = new Date().toISOString().slice(0,16);
+    html += '<div class="tl-arrow">→</div>';
+    html += '<div class="tl-node" style="border-color:var(--green)"><div class="tl-date">'+now+'</div><div class="tl-label">Now (Open)</div></div>';
+  }
+  html += '</div>';
+
+  // P&L breakdown
+  html += '<div class="modal-section-title">P&L Breakdown</div>';
+  html += '<div class="modal-pnl-box">';
+  if (isClosed && ep && xp) {
+    const diff = xp - ep;
+    const pnlPct = ep > 0 ? (diff/ep*100).toFixed(2) : '—';
+    html += '<div class="pnl-row"><span style="color:var(--dim)">Entry Price</span><span>$'+ep.toFixed(4)+'</span></div>';
+    html += '<div class="pnl-row"><span style="color:var(--dim)">Exit Price</span><span>$'+xp.toFixed(4)+'</span></div>';
+    if (sz > 1) html += '<div class="pnl-row"><span style="color:var(--dim)">Size</span><span>'+sz+'</span></div>';
+    html += '<div class="pnl-row"><span style="color:var(--dim)">Price Change</span><span class="'+(diff>=0?'pos':'neg')+'">'+(diff>=0?'+':'')+diff.toFixed(4)+' ('+pnlPct+'%)</span></div>';
+    html += '<div class="pnl-row total"><span>Realized P&L</span><span class="'+(pnl>=0?'pos':'neg')+'">'+pnlSign(pnl)+'</span></div>';
+  } else if (!isClosed && ep && cv) {
+    const unreal = cv - (ep * (sz > 1 ? sz : 1));
+    const pnlPct = ep > 0 ? (unreal/(ep*(sz>1?sz:1))*100).toFixed(2) : '—';
+    html += '<div class="pnl-row"><span style="color:var(--dim)">Entry Price</span><span>$'+ep.toFixed(4)+'</span></div>';
+    html += '<div class="pnl-row"><span style="color:var(--dim)">Current Value</span><span>$'+cv.toFixed(2)+'</span></div>';
+    if (sz > 1) html += '<div class="pnl-row"><span style="color:var(--dim)">Size</span><span>'+sz+'</span></div>';
+    html += '<div class="pnl-row total"><span>Unrealized P&L</span><span class="'+(pnl>=0?'pos':'neg')+'">'+pnlSign(pnl)+'</span></div>';
+  } else {
+    html += '<div class="pnl-row"><span style="color:var(--dim)">P&L</span><span class="'+(pnl>=0?'pos':'neg')+'">'+pnlSign(pnl)+'</span></div>';
+  }
+  html += '</div>';
+
+  // Trade fields
+  html += '<div class="modal-section-title">Trade Details</div>';
+  const fields = [
+    ['Portfolio', portBadge(t.portfolio)],
+    ['Status', jrnlStatusBadge(t.status)],
+    ['Strategy', t.strategy||'—'],
+    ['Description', t.description||t.market||'—'],
+    ['Ticker', t.ticker||'—'],
+    ['Direction', t.direction ? t.direction.toUpperCase() : '—'],
+    ['Entry Date', entDate||'—'],
+    ['Exit Date', extDate||'—'],
+    ['Trade ID', t.id||t.trade_id||'—'],
+  ];
+  fields.forEach(function(f){
+    if (f[1] && f[1] !== '—') {
+      html += '<div class="modal-field"><span class="mf-label">'+f[0]+'</span><span class="mf-val">'+f[1]+'</span></div>';
+    }
+  });
+
+  // Notes
+  const entryNote = t.rationale || t.notes || t.entry_notes || '';
+  const exitNote = t.exit_notes || t.exit_rationale || '';
+  if (entryNote) {
+    html += '<div class="modal-section-title">Entry Rationale</div>';
+    html += '<div style="background:#0d1117;border:1px solid #1e293b;border-radius:8px;padding:12px;font-size:13px;color:var(--text);line-height:1.5">'+entryNote+'</div>';
+  }
+  if (exitNote) {
+    html += '<div class="modal-section-title">Exit Rationale</div>';
+    html += '<div style="background:#0d1117;border:1px solid #1e293b;border-radius:8px;padding:12px;font-size:13px;color:var(--text);line-height:1.5">'+exitNote+'</div>';
+  }
+
+  // Screenshots
+  const scrPaths = [];
+  if (t.screenshot_path) scrPaths.push({url: t.screenshot_path, label: 'Entry Screenshot'});
+  if (t.exit_screenshot_path) scrPaths.push({url: t.exit_screenshot_path, label: 'Exit Screenshot'});
+  if (scrPaths.length) {
+    html += '<div class="modal-section-title">Screenshots</div>';
+    scrPaths.forEach(function(s){
+      const fname = s.url.split('/').pop();
+      html += '<div style="margin-bottom:8px"><div style="font-size:11px;color:var(--dim);margin-bottom:4px">'+s.label+'</div>';
+      html += '<img src="/api/signals/screenshot/'+fname+'" alt="'+s.label+'" class="modal-screenshot" onerror="this.style.display=\'none\'">';
+      html += '</div>';
+    });
+  }
+
+  $('trade-modal-body').innerHTML = html;
+}
+
+function closeTradeModal(event) {
+  if (event && event.target !== $('trade-modal-overlay')) return;
+  $('trade-modal-overlay').style.display = 'none';
+  $('trade-modal-body').innerHTML = '';
+}
+
+// close modal on Escape key
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') {
+    $('trade-modal-overlay').style.display = 'none';
+    $('trade-modal-body').innerHTML = '';
+  }
+});
+
 // Initial load
 loadTrading();
 setInterval(loadTrading,300000);
@@ -1451,6 +2001,7 @@ setInterval(function(){
   const id = active.id;
   if(id==='page-ops') loadOps();
   if(id==='page-portfolio') loadPortfolio();
+  if(id==='page-journal') loadJournal();
   if(id==='page-news') loadNews();
   if(id==='page-etf') loadETF();
   if(id==='page-org') loadOrg();
