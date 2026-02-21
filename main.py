@@ -1641,8 +1641,57 @@ async function loadNews(){
 async function loadOrg(){
   try{const r=await fetch('/api/org');const d=await r.json();renderOrg(d)}catch(e){console.error(e)}
 }
+async function loadCrypto(){
+  try{const r=await fetch('/api/crypto');const d=await r.json();renderCrypto(d)}catch(e){console.error(e)}
+}
 async function loadETF(){
   try{const r=await fetch('/api/etf');const d=await r.json();renderETF(d)}catch(e){console.error(e)}
+}
+
+function renderCrypto(d) {
+  const el = $('crypto-content');
+  if (!d || d.error) { el.innerHTML='<div class="card">Error loading crypto data</div>'; return; }
+  const pnlColor = d.total_pnl >= 0 ? 'var(--green)' : 'var(--red)';
+  const openPos = d.positions.filter(p => p.status === 'open');
+  const monPos = d.positions.filter(p => p.status === 'monitoring');
+
+  let h = '<div class="big-stats">';
+  h += '<div class="big-stat"><div class="label">Starting Capital</div><div class="num">$'+d.starting_capital.toLocaleString()+'</div></div>';
+  h += '<div class="big-stat"><div class="label">Portfolio Value</div><div class="num" style="color:'+pnlColor+'">$'+d.total_value.toLocaleString()+'</div></div>';
+  h += '<div class="big-stat"><div class="label">Total P&L</div><div class="num" style="color:'+pnlColor+'">$'+d.total_pnl.toFixed(2)+' ('+d.total_pnl_pct.toFixed(1)+'%)</div></div>';
+  h += '<div class="big-stat"><div class="label">Open / Monitoring</div><div class="num" style="color:var(--cyan)">'+openPos.length+' / '+monPos.length+'</div></div>';
+  h += '</div>';
+
+  // Strategy allocation
+  h += '<div class="card full"><h3>📊 Strategy Allocation</h3><table><thead><tr><th>Strategy</th><th>Alloc %</th><th>Allocated</th></tr></thead><tbody>';
+  for (const s of d.strategies) {
+    h += '<tr><td>'+s.name+'</td><td>'+s.allocation_pct+'%</td><td>$'+s.allocated.toLocaleString()+'</td></tr>';
+  }
+  h += '</tbody></table></div>';
+
+  // Open positions
+  if (openPos.length > 0 || monPos.length > 0) {
+    h += '<div class="card full"><h3>🪙 Positions</h3><table><thead><tr><th>Strategy</th><th>Trade</th><th>Ticker</th><th>Entry</th><th>Value</th><th>P&L</th><th>Status</th></tr></thead><tbody>';
+    for (const p of [...openPos, ...monPos]) {
+      const pc = p.pnl >= 0 ? 'var(--green)' : 'var(--red)';
+      const statusBadge = p.status === 'monitoring' ? '<span style="color:var(--yellow)">👁 Monitoring</span>' : '<span style="color:var(--green)">● Open</span>';
+      h += '<tr><td>'+p.strategy+'</td><td style="font-size:12px">'+p.description+'</td><td><strong>'+(p.ticker||'-')+'</strong></td><td>'+p.entry_price+'</td><td>$'+(p.current_value||0).toLocaleString()+'</td><td style="color:'+pc+'">$'+(p.pnl||0).toFixed(2)+'</td><td>'+statusBadge+'</td></tr>';
+    }
+    h += '</tbody></table></div>';
+  }
+
+  // Trade log
+  if (d.trades && d.trades.length > 0) {
+    h += '<div class="card full"><h3>📝 Trade Log</h3><table><thead><tr><th>Time</th><th>Action</th><th>Description</th><th>Strategy</th></tr></thead><tbody>';
+    for (const t of d.trades.slice(-20).reverse()) {
+      const ac = t.action==='OPEN'?'var(--green)':t.action==='CLOSE'?'var(--red)':'var(--yellow)';
+      h += '<tr><td>'+t.timestamp+'</td><td style="color:'+ac+'">'+t.action+'</td><td>'+t.description+'</td><td>'+t.strategy+'</td></tr>';
+    }
+    h += '</tbody></table></div>';
+  }
+
+  h += '<div style="color:var(--dim);font-size:11px;margin-top:8px">Updated: '+d.updated+'</div>';
+  el.innerHTML = h;
 }
 
 function renderETF(d) {
@@ -2003,6 +2052,7 @@ setInterval(function(){
   if(id==='page-portfolio') loadPortfolio();
   if(id==='page-journal') loadJournal();
   if(id==='page-news') loadNews();
+  if(id==='page-crypto') loadCrypto();
   if(id==='page-etf') loadETF();
   if(id==='page-org') loadOrg();
 },60000);
